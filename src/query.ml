@@ -37,6 +37,32 @@ type 'r values = { vtable : 'r table; vassigns : 'r assign list }
 
 let values vtable vassigns = { vtable; vassigns }
 
+(* What to do when an insert hits a unique or primary-key conflict. *)
+type 'r on_conflict =
+  | Do_nothing of 'r any_col list
+  | Do_update of {
+      target : 'r any_col list;
+      excluded : 'r any_col list;
+      set : 'r assign list;
+      where : 'r cond option;
+    }
+
+module On_conflict = struct
+  type 'r column = 'r any_col
+
+  let col c = Any c
+  let do_nothing ?(target = []) () = Do_nothing target
+
+  let do_update ~target ?(set = []) ?(excluded = []) ?where () =
+    if target = [] then
+      invalid_arg "Qb.On_conflict.do_update: target must not be empty";
+    if set = [] && excluded = [] then
+      invalid_arg
+        "Qb.On_conflict.do_update: give at least one column in ~set or \
+         ~excluded";
+    Do_update { target; excluded; set; where }
+end
+
 module Ops = struct
   let ( = ) c v = Cmp (c, Eq, v)
   let ( <> ) c v = Cmp (c, Ne, v)
@@ -506,6 +532,37 @@ let render_returning o sel =
       str o " RETURNING ";
       col_names o cols
 
+let render_on_conflict o t = function
+  | Do_nothing [] -> str o " ON CONFLICT DO NOTHING"
+  | Do_nothing target ->
+      str o " ON CONFLICT (";
+      col_names o target;
+      str o ") DO NOTHING"
+  | Do_update { target; excluded; set; where } ->
+      str o " ON CONFLICT (";
+      col_names o target;
+      str o ") DO UPDATE SET ";
+      let items =
+        List.map
+          (fun (Any c) () ->
+            name o c.name;
+            str o " = EXCLUDED.";
+            name o c.name)
+          excluded
+        @ List.map
+            (fun (Set (c, v)) () ->
+              name o c.name;
+              str o " = ";
+              param o c v)
+            set
+      in
+      sep o ", " (fun f -> f ()) items;
+      let prev = o.table_qual in
+      o.table_qual <- Some t.tname;
+      Fun.protect
+        ~finally:(fun () -> o.table_qual <- prev)
+        (fun () -> render_where o where)
+
 let render_update o assigns q =
   not_joined "Qb: update" q;
   base "Qb: update" q.table;
@@ -561,6 +618,23 @@ let insert_many_values_sql ?(dialect = Postgres) vs =
   | first :: _ ->
       sql_of dialect (fun o ->
           render_insert_many_values o vs;
+          render_returning o first.vtable.row)
+
+let upsert_sql ?(dialect = Postgres) conflict v =
+  sql_of dialect (fun o ->
+      render_insert o v.vtable
+        (List.map (fun (Set (c, _)) -> Any c) v.vassigns)
+        (List.map (fun (Set (c, value)) () -> param o c value) v.vassigns);
+      render_on_conflict o v.vtable conflict;
+      render_returning o v.vtable.row)
+
+let upsert_many_sql ?(dialect = Postgres) conflict vs =
+  match vs with
+  | [] -> invalid_arg "Qb.upsert_many_sql: no rows"
+  | first :: _ ->
+      sql_of dialect (fun o ->
+          render_insert_many_values o vs;
+          render_on_conflict o first.vtable conflict;
           render_returning o first.vtable.row)
 
 let insert_many_sql ?(dialect = Postgres) t rows =

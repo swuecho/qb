@@ -277,9 +277,11 @@ migrations into a binary.
   many rows changed (`0`: no such row); `update_returning` and
   `delete_returning` read them back. `execute_count` does the same for a
   statement written as SQL.
-- **Many rows.** `insert_many db Users.table rows` inserts whole rows in one
-  statement; `insert_many_values db rows` does the same for partial `values`
-  rows and returns them with ids and defaults filled in.
+- **Many rows & upserts.** `insert_many db Users.table rows` inserts whole rows
+  in one statement; `insert_many_values db rows` does the same for partial
+  `values` rows and returns them with ids and defaults filled in. `upsert` and
+  `upsert_many` add typed `ON CONFLICT` (`On_conflict.do_nothing` /
+  `On_conflict.do_update` with `~excluded`, `~set`, and `~where`).
 - **Transactions.** `transaction db (fun () -> ...)` commits on `Ok` and
   rolls back on `Error` or an exception. They don't nest, and a nested call
   raises rather than quietly committing the outer one.

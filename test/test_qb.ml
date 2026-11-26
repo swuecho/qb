@@ -275,7 +275,53 @@ let test_select () =
        [ values Tickets.table []; values Tickets.table [] ]);
   Alcotest.check_raises "insert_many_values_sql empty"
     (Invalid_argument "Qb.insert_many_values_sql: no rows") (fun () ->
-      ignore (insert_many_values_sql []))
+      ignore (insert_many_values_sql []));
+  Alcotest.(check string)
+    "upsert do nothing"
+    {|INSERT INTO "users" ("id", "name", "age") VALUES (?, ?, ?) ON CONFLICT DO NOTHING RETURNING "id", "name", "age", "email"|}
+    (upsert_sql
+       (On_conflict.do_nothing ())
+       (values Users.table
+          Ops.[ Users.id := 1; Users.name := "Ann"; Users.age := 34 ]));
+  Alcotest.(check string)
+    "upsert do update with excluded, set, and qualified where"
+    {|INSERT INTO "users" ("id", "name", "age") VALUES (?, ?, ?) ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name", "age" = ? WHERE "users"."age" < ? RETURNING "id", "name", "age", "email"|}
+    (upsert_sql
+       On_conflict.(
+         do_update
+           ~target:[ col Users.id ]
+           ~excluded:[ col Users.name ]
+           ~set:Ops.[ Users.age := 40 ]
+           ~where:Ops.(Users.age < 50)
+           ())
+       (values Users.table
+          Ops.[ Users.id := 1; Users.name := "Ann"; Users.age := 34 ]));
+  Alcotest.(check string)
+    "upsert_many_sql"
+    {|INSERT INTO "users" ("id", "name", "age") VALUES (?, ?, ?), (?, ?, ?) ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name", "age" = EXCLUDED."age" RETURNING "id", "name", "age", "email"|}
+    (upsert_many_sql
+       On_conflict.(
+         do_update
+           ~target:[ col Users.id ]
+           ~excluded:[ col Users.name; col Users.age ]
+           ())
+       [
+         values Users.table
+           Ops.[ Users.id := 1; Users.name := "Ann"; Users.age := 34 ];
+         values Users.table
+           Ops.[ Users.id := 2; Users.name := "Bob"; Users.age := 51 ];
+       ]);
+  Alcotest.check_raises "do_update empty target"
+    (Invalid_argument "Qb.On_conflict.do_update: target must not be empty")
+    (fun () ->
+      ignore On_conflict.(do_update ~target:[] ~excluded:[ col Users.name ] ()));
+  Alcotest.check_raises "do_update empty set and excluded"
+    (Invalid_argument
+       "Qb.On_conflict.do_update: give at least one column in ~set or ~excluded")
+    (fun () -> ignore On_conflict.(do_update ~target:[ col Users.id ] ()));
+  Alcotest.check_raises "upsert_many_sql empty"
+    (Invalid_argument "Qb.upsert_many_sql: no rows") (fun () ->
+      ignore (upsert_many_sql (On_conflict.do_nothing ()) []))
 
 let test_join_sql () =
   check_sql
@@ -608,6 +654,60 @@ let test_insert_returning db =
             values Users.table Ops.[ Users.name := "Hal"; Users.age := 22 ];
             values Users.table Ops.[ Users.name := "Ivy"; Users.age := 28 ];
           ]))
+
+let test_upsert db =
+  seed db;
+  let v id name age =
+    values Users.table
+      Ops.[ Users.id := id; Users.name := name; Users.age := age ]
+  in
+  Alcotest.(check (option user))
+    "do_nothing skips duplicate" None
+    (ok (Blocking.upsert db (On_conflict.do_nothing ()) (v 1 "Ann2" 99)));
+  Alcotest.(check (option user))
+    "do_nothing inserts fresh row"
+    (Some { Users.id = 4; name = "Dee"; age = 25; email = None })
+    (ok (Blocking.upsert db (On_conflict.do_nothing ()) (v 4 "Dee" 25)));
+  Alcotest.(check (option user))
+    "do_update updates conflicting row"
+    (Some { ann with name = "Ann2"; age = 99 })
+    (ok
+       (Blocking.upsert db
+          On_conflict.(
+            do_update
+              ~target:[ col Users.id ]
+              ~excluded:[ col Users.name ]
+              ~set:Ops.[ Users.age := 99 ]
+              ())
+          (v 1 "Ann2" 40)));
+  Alcotest.(check (option user))
+    "do_update with failing where skips row" None
+    (ok
+       (Blocking.upsert db
+          On_conflict.(
+            do_update
+              ~target:[ col Users.id ]
+              ~excluded:[ col Users.name ]
+              ~where:Ops.(Users.age < 50)
+              ())
+          (v 1 "Ignored" 40)));
+  Alcotest.(check (list user))
+    "upsert_many empty" []
+    (ok (Blocking.upsert_many db (On_conflict.do_nothing ()) []));
+  Alcotest.(check (list user))
+    "upsert_many updates existing and inserts new"
+    [
+      { bob with name = "Bob2"; age = 52 };
+      { Users.id = 5; name = "Eve"; age = 30; email = None };
+    ]
+    (ok
+       (Blocking.upsert_many db
+          On_conflict.(
+            do_update
+              ~target:[ col Users.id ]
+              ~excluded:[ col Users.name; col Users.age ]
+              ())
+          [ v 2 "Bob2" 52; v 5 "Eve" 30 ]))
 
 let test_update_delete db =
   seed db;
@@ -1330,6 +1430,7 @@ let db_tests url =
       ("read", test_read);
       ("joins", test_joins);
       ("insert returning", test_insert_returning);
+      ("upsert", test_upsert);
       ("update and delete", test_update_delete);
       ("counts and returning", test_counts_returning);
       ("insert_many, errors, transactions", test_many_transactions);

@@ -181,6 +181,47 @@ val values : 'r table -> 'r assign list -> 'r values
     tables (the [qb-pg-parse] package) have a [values] function that takes each
     column as an argument, required unless the database can fill it in. *)
 
+type 'r on_conflict
+(** What to do when {!S.upsert} or {!S.upsert_many} hits a unique or primary-key
+    conflict. *)
+
+(** Conflict handling for {!S.upsert} and {!S.upsert_many}.
+
+    {[
+    Qb.Blocking.upsert db
+      Qb.On_conflict.(
+        do_update
+          ~target:[ col Users.email ]
+          ~excluded:[ col Users.name; col Users.age ]
+          ())
+      (Users.values ~email:"ann@x.org" ~name:"Ann" ~age:34 ())
+    ]} *)
+module On_conflict : sig
+  type 'r column
+  (** A column of any type, to list conflict target or [EXCLUDED] columns:
+      [[ col Users.email; col Users.org_id ]]. *)
+
+  val col : ('r, _) col -> 'r column
+
+  val do_nothing : ?target:'r column list -> unit -> 'r on_conflict
+  (** Skips conflicting rows ([ON CONFLICT DO NOTHING], or
+      [ON CONFLICT (target) DO NOTHING]). *)
+
+  val do_update :
+    target:'r column list ->
+    ?set:'r assign list ->
+    ?excluded:'r column list ->
+    ?where:'r cond ->
+    unit ->
+    'r on_conflict
+  (** Updates conflicting rows ([ON CONFLICT (target) DO UPDATE SET ...]).
+      [~excluded] sets each listed column to its proposed [EXCLUDED] value;
+      [~set] sets explicit values; [~where] filters which existing rows are
+      updated (table columns are qualified to avoid clashing with [EXCLUDED]).
+      Raises [Invalid_argument] if [target] is empty or if both [~set] and
+      [~excluded] are empty. *)
+end
+
 (** Operators, meant to be opened locally:
     [Ops.(Users.age > 18 && Users.name <> "Bob")]. *)
 module Ops : sig
@@ -458,6 +499,13 @@ val insert_values_sql : ?dialect:dialect -> 'r values -> string
 val insert_many_values_sql : ?dialect:dialect -> 'r values list -> string
 (** Raises [Invalid_argument] with no rows; {!S.insert_many_values} runs nothing
     then. *)
+
+val upsert_sql : ?dialect:dialect -> 'r on_conflict -> 'r values -> string
+
+val upsert_many_sql :
+  ?dialect:dialect -> 'r on_conflict -> 'r values list -> string
+(** Raises [Invalid_argument] with no rows; {!S.upsert_many} runs nothing then.
+*)
 
 val insert_many_sql : ?dialect:dialect -> 'r table -> 'r list -> string
 (** Raises [Invalid_argument] with no rows; {!S.insert_many} runs nothing then.
@@ -855,6 +903,24 @@ module type S = sig
       rows. With no rows it does nothing and returns [[]]. On Postgres, rows may
       set different subsets of columns (omitted ones use [DEFAULT]); on SQLite,
       every row must set the same columns. Not supported by MySQL. *)
+
+  val upsert :
+    db ->
+    'r on_conflict ->
+    'r values ->
+    ('r option, [> Caqti_error.call_or_retrieve ]) result fiber
+  (** Inserts a new row with an [ON CONFLICT] clause, returning [Some row] when
+      the row was inserted or updated, or [None] when a conflict was skipped by
+      {!On_conflict.do_nothing} or filtered out by {!On_conflict.do_update}'s
+      [?where]. Not supported by MySQL. *)
+
+  val upsert_many :
+    db ->
+    'r on_conflict ->
+    'r values list ->
+    ('r list, [> Caqti_error.call_or_retrieve ]) result fiber
+  (** Batch {!upsert} in one statement, returning all inserted or updated rows.
+      With no rows it does nothing and returns [[]]. Not supported by MySQL. *)
 
   val update :
     db ->

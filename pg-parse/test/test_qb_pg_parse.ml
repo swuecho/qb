@@ -155,6 +155,34 @@ let qb_statements dialect =
     ( "insert many default values",
       insert_many_values_sql ~dialect
         [ values Tickets.table []; values Tickets.table [] ] );
+    ( "upsert do nothing",
+      upsert_sql ~dialect
+        (On_conflict.do_nothing ())
+        (values Users.table Ops.[ Users.name := "Ann"; Users.age := 30 ]) );
+    ( "upsert do update",
+      upsert_sql ~dialect
+        On_conflict.(
+          do_update
+            ~target:[ col Users.id ]
+            ~excluded:[ col Users.name ]
+            ~set:Ops.[ Users.age := 40 ]
+            ~where:Ops.(Users.age < 50)
+            ())
+        (values Users.table
+           Ops.[ Users.id := 1; Users.name := "Ann"; Users.age := 30 ]) );
+    ( "upsert many",
+      upsert_many_sql ~dialect
+        On_conflict.(
+          do_update
+            ~target:[ col Users.id ]
+            ~excluded:[ col Users.name; col Users.age ]
+            ())
+        [
+          values Users.table
+            Ops.[ Users.id := 1; Users.name := "Ann"; Users.age := 30 ];
+          values Users.table
+            Ops.[ Users.id := 2; Users.name := "Bob"; Users.age := 40 ];
+        ] );
     ("create users", create_table_sql ~dialect Users.table);
     ("create order", create_table_sql ~dialect Order.table);
     ( "order table",

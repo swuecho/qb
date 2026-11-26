@@ -35,9 +35,9 @@ CLI behaviour for qb-pg-parse: init, check, gen, and queries.
 
   $ printf 'SELECT FROM WHERE' > bad.sql
   $ qb-pg-parse check bad.sql
-  bad.sql: line 1: syntax error at or near "FROM"
+  bad.sql: line 1: syntax error at or near "WHERE"
     SELECT FROM WHERE
-           ^
+                ^
   [1]
 
 `gen` and `queries` respect --bigint int64 and --tables.

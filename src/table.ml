@@ -46,6 +46,9 @@ type out = {
   mutable params : param list; (* reversed *)
   mutable prefix : side list;
       (* While rendering a nested join's ON: where that join sits. *)
+  mutable table_qual : string option;
+      (* While rendering ON CONFLICT ... DO UPDATE WHERE: qualify the target
+         table's columns so they don't clash with EXCLUDED. *)
   mutable variadic : bool;
       (* The text depends on how long a list is (IN, several rows): there is
          no end of such statements, so they aren't kept prepared. *)
@@ -57,6 +60,7 @@ let out dialect =
     buf = Buffer.create 128;
     params = [];
     prefix = [];
+    table_qual = None;
     variadic = false;
   }
 
@@ -67,10 +71,17 @@ let name o n = str o (quote o.dialect n)
 let alias path =
   String.concat "" (List.map (function L -> "l" | R -> "r") path)
 
-(* A column, qualified by its table's alias when it comes from a join. *)
+(* A column, qualified by its table's alias when it comes from a join, or by
+   [table_qual] inside ON CONFLICT ... DO UPDATE WHERE. *)
 let colname o c =
   match o.prefix @ c.path with
-  | [] -> name o c.name
+  | [] -> (
+      match o.table_qual with
+      | Some t ->
+          name o t;
+          str o ".";
+          name o c.name
+      | None -> name o c.name)
   | p ->
       name o (alias p);
       str o ".";

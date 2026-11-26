@@ -14,7 +14,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   domain-safe statement caching, logging (including named statements),
   transactions, prepared statements, `RETURNING`, `distinct`,
   `nulls_first` / `nulls_last` ordering, `insert_many`, `insert_many_values`,
-  and a two-table join.
+  single-table upserts (`On_conflict`, `upsert`, `upsert_many`), and a
+  two-table join.
 - **`qb-lwt`**: the same queries, changesets and transactions on
   `Caqti_lwt` connections.
 - **`qb-pg-parse`**: bindings to libpg_query (releasing the OCaml runtime lock

@@ -58,6 +58,18 @@ module type S = sig
     'r values list ->
     ('r list, [> Caqti_error.call_or_retrieve ]) result fiber
 
+  val upsert :
+    db ->
+    'r on_conflict ->
+    'r values ->
+    ('r option, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val upsert_many :
+    db ->
+    'r on_conflict ->
+    'r values list ->
+    ('r list, [> Caqti_error.call_or_retrieve ]) result fiber
+
   val update :
     db ->
     'r assign list ->
@@ -304,6 +316,28 @@ struct
     | first :: _ as vs ->
         let o = out_for db in
         render_insert_many_values o vs;
+        collect db o first.vtable.row
+
+  let upsert db conflict v =
+    match decoder v.vtable.row with
+    | Dec (rt, decode, cols) -> (
+        let o = out_for db in
+        render_insert o v.vtable
+          (List.map (fun (Set (c, _)) -> Any c) v.vassigns)
+          (List.map (fun (Set (c, value)) () -> param o c value) v.vassigns);
+        render_on_conflict o v.vtable conflict;
+        str o " RETURNING ";
+        col_names o cols;
+        match Cache.finish o with
+        | sql, ps, Pack (pt, pv) ->
+            find_opt db ~oneshot:o.variadic sql ps pt pv rt decode)
+
+  let upsert_many db conflict = function
+    | [] -> B.return (Ok [])
+    | first :: _ as vs ->
+        let o = out_for db in
+        render_insert_many_values o vs;
+        render_on_conflict o first.vtable conflict;
         collect db o first.vtable.row
 
   let update db assigns q =
