@@ -704,6 +704,23 @@ let query_errors () =
       Alcotest.(check string)
         "no name" "expected -- name: query_name before this statement" e.message
   | Ok _ -> Alcotest.fail "expected an error");
+  (* Error positions point at the offending clause or stay None when unlocated. *)
+  let check_pos label sql expected =
+    match Query.one st sql with
+    | Error e -> Alcotest.(check (option int)) label expected e.position
+    | Ok _ -> Alcotest.failf "%s: expected an error" label
+  in
+  check_pos "duplicate table points at second table"
+    "SELECT email FROM accounts JOIN accounts ON true" (Some 32);
+  check_pos "extra INSERT value points at extra item"
+    "INSERT INTO accounts (email) VALUES (:a, :b)" (Some 41);
+  check_pos "unlocated multi-statement keeps position None" "SELECT 1; SELECT 2"
+    None;
+  (match Query.of_sql st "-- name: dup\nSELECT 1;\n-- name: dup\nSELECT 2;" with
+  | Error e ->
+      Alcotest.(check (option int))
+        "duplicate query name points at second header" (Some 23) e.position
+  | Ok _ -> Alcotest.fail "expected duplicate query name error");
   (* Without ~tables, t.* is spelled out, and two ids can't share a record. *)
   let sql =
     "-- name: q\n\

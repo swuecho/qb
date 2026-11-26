@@ -42,9 +42,9 @@ So is a variable of the wrong type.
   > let q = let name = 3 in [%sql "SELECT id FROM users WHERE name = :name"]
   > EOF
   $ build Wrong_type
-  File "wrong_type.ml", line 1, characters 66-71:
+  File "wrong_type.ml", line 1, characters 65-70:
   1 | let q = let name = 3 in [%sql "SELECT id FROM users WHERE name = :name"]
-                                                                        ^^^^^
+                                                                       ^^^^^
   Error: The value name has type int but an expression was expected of type
            string
 
@@ -54,10 +54,33 @@ A misspelt column, with what was probably meant.
   > let q = [%sql "SELECT id FROM users WHERE emial = 'a'"]
   > EOF
   $ build Misspelt
-  File "misspelt.ml", line 1, characters 43-44:
+  File "misspelt.ml", line 1, characters 42-47:
   1 | let q = [%sql "SELECT id FROM users WHERE emial = 'a'"]
-                                                 ^
+                                                ^^^^^
   Error: unknown column emial (did you mean email?)
+
+A qualified misspelt column inside a delimited string highlights the full
+qualified reference at the exact column.
+
+  $ cat > qualified.ml <<EOF
+  > let q = [%sql {sql|SELECT u.emial FROM users u|sql}]
+  > EOF
+  $ build Qualified
+  File "qualified.ml", line 1, characters 26-33:
+  1 | let q = [%sql {sql|SELECT u.emial FROM users u|sql}]
+                                ^^^^^^^
+  Error: unknown column u.emial (did you mean email?)
+
+An unbound nullable :name? highlights the full parameter including ?.
+
+  $ cat > nullable_param.ml <<EOF
+  > let q = [%sql "SELECT id FROM users WHERE age = :age?"]
+  > EOF
+  $ build Nullable_param
+  File "nullable_param.ml", line 1, characters 48-53:
+  1 | let q = [%sql "SELECT id FROM users WHERE age = :age?"]
+                                                      ^^^^^
+  Error: Unbound value age
 
 An INSERT that leaves out a column the database can't fill in.
 
@@ -65,9 +88,9 @@ An INSERT that leaves out a column the database can't fill in.
   > let q name = [%sql "INSERT INTO users (name) VALUES (:name)"]
   > EOF
   $ build Left_out
-  File "left_out.ml", line 1, characters 33-34:
+  File "left_out.ml", line 1, characters 32-37:
   1 | let q name = [%sql "INSERT INTO users (name) VALUES (:name)"]
-                                       ^
+                                      ^^^^^
   Error: INSERT leaves out email: it is NOT NULL and has no default
 
 A function qb has no type for, and the cast that gives it one.
@@ -76,9 +99,9 @@ A function qb has no type for, and the cast that gives it one.
   > let q = [%sql "SELECT soundex(name) FROM users"]
   > EOF
   $ build No_type
-  File "no_type.ml", line 1, characters 23-24:
+  File "no_type.ml", line 1, characters 22-29:
   1 | let q = [%sql "SELECT soundex(name) FROM users"]
-                             ^
+                            ^^^^^^^
   Error: qb doesn't know what soundex(...) returns: say so with a cast, e.g.
          soundex(...)::text
 

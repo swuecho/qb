@@ -113,13 +113,82 @@ let schema ~dir =
       Hashtbl.replace schemas dir s;
       s
 
+(* Length of the SQL token starting at [off] (never crossing a newline), so
+   editor squiggles cover the whole identifier, qualified name, or parameter
+   instead of a single character. *)
+let token_len s off =
+  let n = String.length s in
+  if off >= n then 0
+  else
+    let line_end =
+      match String.index_from_opt s off '\n' with Some i -> i | None -> n
+    in
+    if off >= line_end then 0
+    else
+      let is_ident = function
+        | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' | '$' -> true
+        | _ -> false
+      in
+      let scan_ident i =
+        let rec go j =
+          if j < line_end && is_ident s.[j] then go (j + 1) else j
+        in
+        go i
+      in
+      let scan_quoted q i =
+        let rec go j =
+          if j >= line_end then line_end
+          else if s.[j] = q then
+            if j + 1 < line_end && s.[j + 1] = q then go (j + 2) else j + 1
+          else go (j + 1)
+        in
+        go (i + 1)
+      in
+      let stop =
+        match s.[off] with
+        | ':' when off + 1 < line_end && is_ident s.[off + 1] ->
+            let j = scan_ident (off + 1) in
+            if j < line_end && s.[j] = '?' then j + 1 else j
+        | '$'
+          when off + 1 < line_end && s.[off + 1] >= '0' && s.[off + 1] <= '9' ->
+            let rec go j =
+              if j < line_end && s.[j] >= '0' && s.[j] <= '9' then go (j + 1)
+              else j
+            in
+            go (off + 1)
+        | '\'' -> scan_quoted '\'' off
+        | '"' | 'a' .. 'z' | 'A' .. 'Z' | '_' ->
+            let rec chain i =
+              let j =
+                if i < line_end && s.[i] = '"' then scan_quoted '"' i
+                else scan_ident i
+              in
+              if j + 1 < line_end && s.[j] = '.' then
+                match s.[j + 1] with
+                | '*' -> j + 2
+                | '"' | 'a' .. 'z' | 'A' .. 'Z' | '_' -> chain (j + 1)
+                | _ -> j
+              else j
+            in
+            chain off
+        | '0' .. '9' ->
+            let rec go j =
+              if j < line_end && ((s.[j] >= '0' && s.[j] <= '9') || s.[j] = '.')
+              then go (j + 1)
+              else j
+            in
+            go (off + 1)
+        | _ -> off + 1
+      in
+      max 1 (stop - off)
+
 (* Where the [len] bytes at [off] of the string's contents are in the source
-   file. Exact for {|quoted|} strings and for plain ones without escapes. *)
-let position ?(len = 1) (loc : Location.t) delim s off =
+   file. [loc] from [Pconst_string] already starts at the first byte of the
+   contents (past the opening quote or delimiter). Exact for {|quoted|} strings
+   and for plain ones without escapes. *)
+let position ~len (loc : Location.t) s off =
   let open Lexing in
-  let skip = match delim with None -> 1 | Some d -> String.length d + 2 in
-  let start = { loc.loc_start with pos_cnum = loc.loc_start.pos_cnum + skip } in
-  let pos = ref start in
+  let pos = ref loc.loc_start in
   String.iteri
     (fun i c ->
       if i < off then
@@ -171,7 +240,7 @@ let relocate loc params =
       | _ -> e
   end
 
-let expand rows ~ctxt sql str_loc delim =
+let expand rows ~ctxt sql str_loc _delim =
   let loc = Expansion_context.Extension.extension_point_loc ctxt in
   match schema ~dir:(Filename.dirname loc.loc_start.pos_fname) with
   | Error m -> error ~loc "qb: %s" m
@@ -180,7 +249,7 @@ let expand rows ~ctxt sql str_loc delim =
       | Error e ->
           let loc =
             match e.position with
-            | Some p -> position str_loc delim sql p
+            | Some p -> position ~len:(token_len sql p) str_loc sql p
             | None -> str_loc
           in
           error ~loc "%s" e.message
@@ -195,13 +264,20 @@ let expand rows ~ctxt sql str_loc delim =
           with
           | exception Invalid_argument m -> error ~loc "qb: %s" m
           | src ->
+              let param_len (p : Query.param) =
+                let base = 1 + String.length p.name in
+                if
+                  p.nullable
+                  && p.at + base < String.length sql
+                  && sql.[p.at + base] = '?'
+                then base + 1
+                else base
+              in
               let params =
                 List.map
                   (fun (p : Query.param) ->
                     ( Codegen.ident p.name,
-                      position
-                        ~len:(1 + String.length p.name)
-                        str_loc delim sql p.at ))
+                      position ~len:(param_len p) str_loc sql p.at ))
                   q.params
               in
               (relocate loc params)#expression

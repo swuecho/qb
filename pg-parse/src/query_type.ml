@@ -19,10 +19,12 @@ let rec sources schema j =
             | Some a -> Option.value (str "aliasname" a) ~default:name
             | None -> name
           in
-          ([ { alias; table; outer = false; qualified = false } ], []))
+          ( [ { alias; table; outer = false; qualified = false; at = loc r } ],
+            [] ))
   | Some ("JoinExpr", je) ->
       if list "usingClause" je <> [] || bool "isNatural" je then
-        fail "JOIN ... USING and NATURAL JOIN aren't supported: write ON";
+        fail ?at:(loc je)
+          "JOIN ... USING and NATURAL JOIN aren't supported: write ON";
       let get k = sources schema (Option.value (field k je) ~default:`Null) in
       let l, lq = get "larg" and r, rq = get "rarg" in
       let outer = List.map (fun s -> { s with outer = true }) in

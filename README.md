@@ -209,9 +209,9 @@ your folder names):
 Mistakes are compile errors at the place in the SQL:
 
 ```
-File "bin/main.ml", line 5, characters 12-13:
+File "bin/main.ml", line 5, characters 12-17:
 5 |       WHERE emial = :email|}]
-                ^
+                ^^^^^
 Error: unknown column emial (did you mean email?)
 ```
 

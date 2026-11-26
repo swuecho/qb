@@ -114,9 +114,13 @@ let targets env items =
        items
 
 let new_env scope names =
-  (match Util.first_dup_by (fun (s : source) -> s.alias) scope with
-  | Some alias -> fail "table %s is named twice: give one an alias" alias
-  | None -> ());
+  let seen_aliases = Hashtbl.create 8 in
+  List.iter
+    (fun (s : source) ->
+      if Hashtbl.mem seen_aliases s.alias then
+        fail ?at:s.at "table %s is named twice: give one an alias" s.alias;
+      Hashtbl.add seen_aliases s.alias ())
+    scope;
   {
     scope;
     names;
@@ -142,7 +146,9 @@ let finish env row =
   (params, row, !(env.null_tests))
 
 let unsupported s k what =
-  match field k s with Some _ -> fail "%s isn't supported" what | None -> ()
+  match field k s with
+  | Some v -> fail ?at:(loc v) "%s isn't supported" what
+  | None -> ()
 
 let select schema names s =
   unsupported s "withClause" "WITH";
@@ -292,9 +298,17 @@ let insert schema names s =
                 | _ -> []
               in
               if List.length items > List.length cols then
-                fail "INSERT has more values than columns";
-              if explicit_cols && List.length items < List.length cols then
-                fail "INSERT has fewer values than columns";
+                fail
+                  ?at:(loc (List.nth items (List.length cols)))
+                  "INSERT has more values than columns";
+              (if explicit_cols && List.length items < List.length cols then
+                 let at =
+                   match List.rev items with
+                   | last :: _ -> loc last
+                   | [] ->
+                       loc (Option.value (field "relation" s) ~default:`Null)
+                 in
+                 fail ?at "INSERT has fewer values than columns");
               List.iteri (fun i v -> assign values (List.nth cols i) v) items)
             rows)
   | Some _ -> fail "this INSERT isn't supported");
@@ -345,14 +359,16 @@ let delete schema names s =
 
 (* ---------- entry points ---------- *)
 
-let query schema (name, name_at, start, text) =
+let query ?fallback schema (name, name_at, start, text) =
   if not (valid_name name) then
     raise
       (Fail (Printf.sprintf "%S isn't a name for a query" name, Some name_at));
   let in_file back = function
     | Fail (m, at) ->
-        Fail
-          (m, Some (match at with Some p -> start + back p | None -> name_at))
+        let pos =
+          match at with Some p -> Some (start + back p) | None -> fallback
+        in
+        Fail (m, pos)
     | e -> e
   in
   let pg_sql, params, back, first =
@@ -391,10 +407,17 @@ let query schema (name, name_at, start, text) =
 
 let of_sql schema text =
   try
-    let qs = List.map (query schema) (split text) in
-    (match Util.first_dup_by (fun (q : t) -> q.name) qs with
-    | Some name -> fail "two queries are named %s" name
-    | None -> ());
+    let entries = split text in
+    let seen = Hashtbl.create 8 in
+    let qs =
+      List.map
+        (fun ((name, name_at, _, _) as entry) ->
+          if Hashtbl.mem seen name then
+            fail ~at:name_at "two queries are named %s" name;
+          Hashtbl.add seen name ();
+          query ~fallback:name_at schema entry)
+        entries
+    in
     Ok qs
   with Fail (message, position) -> Error { Pg.message; position }
 

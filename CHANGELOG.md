@@ -24,8 +24,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and type SQL queries. `gen`, `queries`, and `check` accept directories as
   well as individual `.sql` files, and `init` supports `--bigint int64`.
 - **`qb-ppx`**: `[%sql "..."]` and `[%sql.obj "..."]` queries checked and typed
-  against your migrations at compile time, including `-qb-bigint int|int64` and
-  automatic `file.ml:line` statement names in `Qb.src` debug logs.
+  against your migrations at compile time, including `-qb-bigint int|int64`,
+  full-token error spans (with exact single-line and delimited-string offsets),
+  and automatic `file.ml:line` statement names in `Qb.src` debug logs.
 - **`qb-migrate`**: apply and verify `migrations/*.sql` against PostgreSQL
   (with SHA-256 checksums, `pg_dump` `search_path` and tuple-returning
   statement support, and atomic `baseline`), as a library or with the

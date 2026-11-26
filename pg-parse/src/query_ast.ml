@@ -16,7 +16,13 @@ type t = { name : string; sql : string; params : param list; row : item list }
 
 (* [qualified] is the EXCLUDED row of ON CONFLICT: its columns are only
    meant when written excluded.c. *)
-type source = { alias : string; table : table; outer : bool; qualified : bool }
+type source = {
+  alias : string;
+  table : table;
+  outer : bool;
+  qualified : bool;
+  at : int option;
+}
 
 type env = {
   scope : source list;
@@ -31,7 +37,15 @@ type env = {
 exception Fail of string * int option
 
 let fail ?at fmt = Printf.ksprintf (fun m -> raise (Fail (m, at))) fmt
-let loc j = match field "location" j with Some (`Int i) -> Some i | _ -> None
+
+let loc j =
+  match field "location" j with
+  | Some (`Int i) -> Some i
+  | _ -> (
+      match node j with
+      | Some (_, body) -> (
+          match field "location" body with Some (`Int i) -> Some i | _ -> None)
+      | None -> None)
 
 (* ---------- "did you mean" ---------- *)
 
