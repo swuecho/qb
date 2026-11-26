@@ -1,0 +1,12 @@
+; Where -qb-schema is found, whichever folder the rewriter is run from: dune
+; runs it from the build root, merlin (the editor) from the nearest folder with
+; a dune file, giving the file's name alone.
+
+(executable
+ (name driver)
+ (modules driver)
+ (libraries qb-ppx ppxlib))
+
+(cram
+ (package qb-ppx)
+ (deps driver.exe))

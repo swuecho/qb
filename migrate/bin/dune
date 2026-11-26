@@ -1,0 +1,11 @@
+(executable
+ (name main)
+ (public_name qb-migrate)
+ (package qb-migrate)
+ (libraries
+  qb_migrate
+  cmdliner
+  caqti.blocking
+  caqti-driver-postgresql
+  ptime
+  uri))

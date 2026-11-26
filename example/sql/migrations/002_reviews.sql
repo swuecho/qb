@@ -1,0 +1,6 @@
+CREATE TABLE reviews (
+  id BIGSERIAL PRIMARY KEY,
+  book_id BIGINT NOT NULL REFERENCES books (id),
+  stars INTEGER NOT NULL,
+  note TEXT
+);

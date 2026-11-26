@@ -1,0 +1,20 @@
+; The tutorial in doc/tutorial.md. Run with: dune exec ./example/sql/main.exe
+
+; 1. Table modules from the migrations.
+
+(rule
+ (targets schema.ml)
+ (deps
+  (glob_files migrations/*.sql))
+ (action
+  (run qb-pg-parse gen %{deps} -o %{targets})))
+
+; 2. [%sql "..."] checked against the same migrations.
+
+(executable
+ (name main)
+ (preprocess
+  (pps qb-ppx -- -qb-schema migrations -qb-tables Schema))
+ (preprocessor_deps
+  (source_tree migrations))
+ (libraries qb caqti.blocking caqti-driver-sqlite3 uri))

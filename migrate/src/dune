@@ -1,0 +1,4 @@
+(library
+ (name qb_migrate)
+ (public_name qb-migrate)
+ (libraries qb_pg_parse caqti caqti.blocking ptime))

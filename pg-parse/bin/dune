@@ -1,0 +1,5 @@
+(executable
+ (name main)
+ (public_name qb-pg-parse)
+ (package qb-pg-parse)
+ (libraries qb_pg_parse cmdliner))

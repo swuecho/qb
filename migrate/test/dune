@@ -1,0 +1,13 @@
+(test
+ (name test_qb_migrate)
+ (package qb-migrate)
+ (deps
+  (env_var QB_TEST_PG_URL))
+ (libraries
+  qb_migrate
+  qb_pg_parse
+  alcotest
+  caqti
+  caqti.blocking
+  caqti-driver-postgresql
+  uri))

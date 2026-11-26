@@ -1,0 +1,5 @@
+(library
+ (name qb_ppx)
+ (public_name qb-ppx)
+ (kind ppx_rewriter)
+ (libraries ppxlib qb_pg_parse))

@@ -1,0 +1,34 @@
+; The tables, from pg-parse's test migrations; [%sql] is checked against the
+; same files.
+
+(rule
+ (targets schema_gen.ml)
+ (deps
+  (glob_files %{workspace_root}/pg-parse/test/schema/*.sql))
+ (action
+  (run
+   %{exe:../../pg-parse/bin/main.exe}
+   gen
+   %{workspace_root}/pg-parse/test/schema/001_init.sql
+   %{workspace_root}/pg-parse/test/schema/002_changes.sql
+   -o
+   %{targets})))
+
+(test
+ (name test_qb_ppx)
+ (package qb-ppx)
+ (preprocess
+  (pps qb-ppx -- -qb-schema pg-parse/test/schema -qb-tables Schema_gen))
+ (preprocessor_deps
+  (source_tree %{workspace_root}/pg-parse/test/schema))
+ (deps
+  (env_var QB_TEST_PG_URL))
+ (libraries
+  qb
+  alcotest
+  caqti
+  caqti.blocking
+  caqti-driver-sqlite3
+  caqti-driver-postgresql
+  ptime
+  uri))

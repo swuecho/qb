@@ -1,0 +1,25 @@
+(test
+ (name test_qb)
+ (modules test_qb)
+ (package qb)
+ (deps
+  (env_var QB_TEST_PG_URL))
+ (libraries
+  qb
+  alcotest
+  caqti.blocking
+  caqti-driver-sqlite3
+  caqti-driver-postgresql
+  ptime
+  uri))
+
+; The tokenizer on its own. It is private to qb and to qb-pg-parse, so the
+; test compiles the same file.
+
+(copy_files# ../src/sql_tokens.ml)
+
+(test
+ (name test_sql_tokens)
+ (modules sql_tokens test_sql_tokens)
+ (package qb)
+ (libraries angstrom alcotest))

@@ -1,0 +1,13 @@
+; What a mistake in [%sql] looks like to the person who made it: a real
+; build of a small project, with the compiler's own report of where.
+
+; The compiler's wording of a type error is that of OCaml 5.4.
+
+(cram
+ (package qb-ppx)
+ (enabled_if
+  (>= %{ocaml_version} 5.4))
+ (deps
+  (package qb)
+  (package qb-pg-parse)
+  (package qb-ppx)))

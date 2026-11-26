@@ -1,0 +1,4 @@
+(library
+ (name qb_lwt)
+ (public_name qb-lwt)
+ (libraries qb caqti caqti-lwt lwt))

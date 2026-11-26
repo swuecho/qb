@@ -1,0 +1,12 @@
+(library
+ (name qb)
+ (public_name qb)
+ (libraries
+  angstrom
+  caqti
+  caqti.blocking
+  logs
+  mtime
+  mtime.clock.os
+  ptime
+  uri))

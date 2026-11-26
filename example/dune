@@ -1,0 +1,14 @@
+; Run with: dune exec ./example/users.exe
+; Uses labeled tuples, so it needs OCaml 5.4; the library itself does not.
+
+(executable
+ (name users)
+ (modules users)
+ (enabled_if
+  (>= %{ocaml_version} 5.4))
+ (libraries qb logs caqti.blocking caqti-driver-sqlite3 uri))
+
+(executable
+ (name join)
+ (modules join)
+ (libraries qb caqti.blocking caqti-driver-sqlite3 uri))

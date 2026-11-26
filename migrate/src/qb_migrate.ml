@@ -1,0 +1,538 @@
+(* Qb_migrate: applies migrations to Postgres. See qb_migrate.mli. *)
+
+open Qb_pg_parse
+
+type migration = { name : string; sql : string }
+type db = Caqti_blocking.connection
+
+type error =
+  [ `Changed of string
+  | `Missing of string
+  | `Out_of_order of string * string
+  | `Invalid of string * string
+  | `Failed of string * string
+  | `Not_verified of string list
+  | `Db of Caqti_error.t ]
+
+let error_to_string : error -> string = function
+  | `Changed n ->
+      Printf.sprintf
+        "%s was changed after it was applied: put it back, and make the change \
+         in a new migration"
+        n
+  | `Missing n ->
+      Printf.sprintf "%s was applied, and is no longer among the migrations" n
+  | `Out_of_order (pending, applied) ->
+      Printf.sprintf
+        "%s is not applied, and comes before %s, which is: rename it to come \
+         last, or allow migrations out of order"
+        pending applied
+  | `Invalid (n, m) -> Printf.sprintf "%s: %s" n m
+  | `Failed (n, m) -> Printf.sprintf "%s failed: %s" n m
+  | `Not_verified diffs ->
+      "the database doesn't match the migrations:\n  "
+      ^ String.concat "\n  " diffs
+  | `Db e -> Caqti_error.show e
+
+type status =
+  | Applied of Ptime.t
+  | Pending
+  | Changed of Ptime.t
+  | Missing of Ptime.t
+
+let ( let* ) = Result.bind
+
+let of_dir dir =
+  match Sys.readdir dir with
+  | exception Sys_error m -> Error m
+  | files ->
+      Array.to_list files
+      |> List.filter (fun f -> Filename.check_suffix f ".sql")
+      |> List.sort compare
+      |> List.fold_left
+           (fun acc name ->
+             let* acc = acc in
+             match
+               In_channel.with_open_bin (Filename.concat dir name)
+                 In_channel.input_all
+             with
+             | sql -> Ok ({ name; sql } :: acc)
+             | exception Sys_error m -> Error m)
+           (Ok [])
+      |> Result.map List.rev
+
+let checksum m = Digest.to_hex (Digest.string m.sql)
+
+(* ---------- talking to the database ---------- *)
+
+module type DB = Caqti_blocking.CONNECTION
+
+let db_error r = Result.map_error (fun e -> `Db (e :> Caqti_error.t)) r
+
+(* A migration's statement is sent as it is: Caqti reads nothing into its
+   [?] or [$]. *)
+let literal sql =
+  Caqti_request.create ~oneshot:true Caqti_type.unit Caqti_type.unit
+    Caqti_mult.zero (fun _ -> Caqti_query.L sql)
+
+module Q = struct
+  open Caqti_request.Infix
+  open Caqti_type
+
+  let create_table =
+    literal
+      "CREATE TABLE IF NOT EXISTS qb_migrations (name TEXT PRIMARY KEY, \
+       checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+
+  let has_table =
+    (unit ->! bool) "SELECT to_regclass('qb_migrations') IS NOT NULL"
+
+  let applied =
+    (unit ->* t3 string string ptime)
+      "SELECT name, checksum, applied_at FROM qb_migrations ORDER BY name"
+
+  let record =
+    (t2 string string ->. unit)
+      "INSERT INTO qb_migrations (name, checksum) VALUES (?, ?)"
+
+  (* One key for every qb-migrate run on the database. *)
+  let lock = (unit ->! bool) "SELECT true FROM pg_advisory_lock(7126173401)"
+  let unlock = (unit ->! bool) "SELECT pg_advisory_unlock(7126173401)"
+  let current_schema = (unit ->! string) "SELECT current_schema()::text"
+
+  (* Each column of each table: its type's name, whether it can be NULL,
+     the type's length or precision where it has one, and whether the
+     database fills it in (a default, an identity, a generated column). *)
+  let columns =
+    (unit
+    ->* t2 (t2 string string)
+          (t2 (t3 string string bool)
+             (t2
+                (t3 (option int) (option int) (option int))
+                (t2 (option int) bool))))
+      "SELECT c.table_schema::text, c.table_name::text, c.column_name::text, \
+       c.udt_name::text, c.is_nullable = 'YES', \
+       c.character_maximum_length::int, c.numeric_precision::int, \
+       c.numeric_scale::int, c.datetime_precision::int, (c.column_default IS \
+       NOT NULL OR c.is_identity = 'YES' OR c.is_generated = 'ALWAYS') FROM \
+       information_schema.columns c JOIN information_schema.tables t ON \
+       t.table_schema = c.table_schema AND t.table_name = c.table_name WHERE \
+       t.table_type = 'BASE TABLE' AND c.table_schema NOT IN ('pg_catalog', \
+       'information_schema') ORDER BY 1, 2, c.ordinal_position"
+
+  (* Each primary key's columns, in the key's order. *)
+  let primary_keys =
+    (unit ->* t2 (t2 string string) string)
+      "SELECT n.nspname::text, c.relname::text, a.attname::text FROM pg_index \
+       i JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = \
+       c.relnamespace JOIN unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, \
+       ord) ON true JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = \
+       k.attnum WHERE i.indisprimary ORDER BY 1, 2, k.ord"
+end
+
+let applied (module Db : DB) =
+  let* exists = db_error (Db.find Q.has_table ()) in
+  if exists then db_error (Db.collect_list Q.applied ()) else Ok []
+
+let with_lock (module Db : DB) f =
+  let* _ = db_error (Db.find Q.lock ()) in
+  let unlock () = ignore (Db.find Q.unlock ()) in
+  match f () with
+  | r ->
+      unlock ();
+      r
+  | exception e ->
+      unlock ();
+      raise e
+
+(* ---------- status ---------- *)
+
+let statuses ms applied =
+  List.map
+    (fun m ->
+      ( m.name,
+        match List.find_opt (fun (n, _, _) -> n = m.name) applied with
+        | None -> Pending
+        | Some (_, sum, at) when sum = checksum m -> Applied at
+        | Some (_, _, at) -> Changed at ))
+    ms
+  @ List.filter_map
+      (fun (n, _, at) ->
+        if List.exists (fun m -> m.name = n) ms then None
+        else Some (n, Missing at))
+      applied
+
+let status db ms =
+  let* applied = applied db in
+  Ok (statuses ms applied)
+
+(* ---------- run ---------- *)
+
+let no_transaction m =
+  let first =
+    match String.index_opt m.sql '\n' with
+    | Some i -> String.sub m.sql 0 i
+    | None -> m.sql
+  in
+  String.trim first = "-- qb:no-transaction"
+
+(* A migration's statements. One that runs in a transaction can't have its
+   own: its COMMIT would end the runner's, and what follows, with the record
+   that it was applied, would no longer be undone together. *)
+let split m =
+  let sql = Pg.strip_psql_meta m.sql in
+  let parsed r =
+    Result.map_error (fun e -> `Invalid (m.name, Pg.error_to_string ~sql e)) r
+  in
+  let* nodes = parsed (Pg.statements sql) in
+  let own_transaction =
+    List.exists
+      (function `Assoc [ ("TransactionStmt", _) ] -> true | _ -> false)
+      nodes
+  in
+  if own_transaction && not (no_transaction m) then
+    Error
+      (`Invalid
+         ( m.name,
+           "it has its own BEGIN or COMMIT, and a migration already runs in a \
+            transaction: take them out, or make -- qb:no-transaction its first \
+            line" ))
+  else parsed (Pg.split sql)
+
+(* What stops a run before anything is applied. *)
+let check ~out_of_order ms applied =
+  let st = statuses ms applied in
+  (* [pending]: the first migration not yet applied, once one is seen. *)
+  let rec go pending = function
+    | [] -> Ok ()
+    | (n, Changed _) :: _ -> Error (`Changed n)
+    | (n, Missing _) :: _ -> Error (`Missing n)
+    | (n, Pending) :: rest ->
+        go (match pending with None -> Some n | p -> p) rest
+    | (n, Applied _) :: rest -> (
+        match pending with
+        | Some p when not out_of_order -> Error (`Out_of_order (p, n))
+        | _ -> go pending rest)
+  in
+  let* () = go None st in
+  Ok (List.filter_map (fun (n, s) -> if s = Pending then Some n else None) st)
+
+let first_line s =
+  match String.index_opt s '\n' with
+  | Some i -> String.sub s 0 i ^ " ..."
+  | None -> s
+
+let apply (module Db : DB) m stmts =
+  let failed stmt e ~kept =
+    `Failed
+      ( m.name,
+        Printf.sprintf "%s\n  in: %s%s" (Caqti_error.show e) (first_line stmt)
+          (if kept then
+             "\n\
+             \  it runs without a transaction: what came before this statement \
+              stays"
+           else "") )
+  in
+  let rec exec ~kept = function
+    | [] -> Ok ()
+    | stmt :: rest -> (
+        match Db.exec (literal stmt) () with
+        | Ok () -> exec ~kept rest
+        | Error e -> Error (failed stmt e ~kept))
+  in
+  let record () = db_error (Db.exec Q.record (m.name, checksum m)) in
+  if no_transaction m then
+    let* () = exec ~kept:true stmts in
+    record ()
+  else
+    let* () = db_error (Db.start ()) in
+    match
+      let* () = exec ~kept:false stmts in
+      record ()
+    with
+    | Ok () -> db_error (Db.commit ())
+    | Error _ as e ->
+        ignore (Db.rollback ());
+        e
+
+let run ?(out_of_order = false) ((module Db : DB) as db) ms =
+  with_lock db @@ fun () ->
+  let* () = db_error (Db.exec Q.create_table ()) in
+  let* applied = db_error (Db.collect_list Q.applied ()) in
+  let* pending = check ~out_of_order ms applied in
+  let pending = List.filter (fun m -> List.mem m.name pending) ms in
+  (* Every pending migration must parse before the first is applied. *)
+  let* parsed =
+    List.fold_left
+      (fun acc m ->
+        let* acc = acc in
+        let* stmts = split m in
+        Ok ((m, stmts) :: acc))
+      (Ok []) pending
+  in
+  List.fold_left
+    (fun acc (m, stmts) ->
+      let* acc = acc in
+      let* () = apply db m stmts in
+      Ok (m.name :: acc))
+    (Ok []) (List.rev parsed)
+  |> Result.map List.rev
+
+(* ---------- verify ---------- *)
+
+(* The schema the migrations describe, as [%sql] reads it. *)
+let schema ms =
+  List.fold_left
+    (fun st m ->
+      let* st = st in
+      let sql = Pg.strip_psql_meta m.sql in
+      Result.map_error
+        (fun e -> `Invalid (m.name, Pg.error_to_string ~sql e))
+        (Schema.apply_sql ~init:st sql))
+    (Ok Schema.empty) ms
+
+(* information_schema's name for a column type: the internal name, with a
+   leading underscore for an array. A user type is compared without its
+   schema. *)
+let udt_name (ty : Schema.pg_type) =
+  let base =
+    match String.rindex_opt ty.name '.' with
+    | Some i -> String.sub ty.name (i + 1) (String.length ty.name - i - 1)
+    | None -> ty.name
+  in
+  if ty.array_dims > 0 then "_" ^ base else base
+
+(* A column as the database has it. *)
+type live = {
+  column : string;
+  udt : string;
+  nullable : bool;
+  length : int option;
+  precision : int option;
+  scale : int option;
+  time_precision : int option;
+  filled : bool; (* a default, an identity or a generated column *)
+}
+
+(* The length or precision a migration gives a type, against the database's:
+   the database's, written as the migration would, when they differ. A type
+   written without one is compared only where that has one meaning. *)
+let mods_differ (ty : Schema.pg_type) (l : live) =
+  let some = Option.map string_of_int in
+  let written, live =
+    if ty.array_dims > 0 then (None, None)
+    else
+      match (ty.name, ty.mods) with
+      | "varchar", [] -> (None, some l.length)
+      | ("varchar" | "bpchar"), [ n ] -> (Some (string_of_int n), some l.length)
+      | "numeric", [] ->
+          ( None,
+            Option.map
+              (fun p ->
+                Printf.sprintf "%d,%d" p (Option.value l.scale ~default:0))
+              l.precision )
+      | "numeric", [ p ] ->
+          ( Some (Printf.sprintf "%d,0" p),
+            Option.map
+              (fun p ->
+                Printf.sprintf "%d,%d" p (Option.value l.scale ~default:0))
+              l.precision )
+      | "numeric", [ p; sc ] ->
+          ( Some (Printf.sprintf "%d,%d" p sc),
+            Option.map
+              (fun p ->
+                Printf.sprintf "%d,%d" p (Option.value l.scale ~default:0))
+              l.precision )
+      | ("timestamp" | "timestamptz" | "time" | "timetz"), [ p ] ->
+          (Some (string_of_int p), some l.time_precision)
+      | _ -> (None, None)
+  in
+  if written = live then None
+  else Some (match live with Some m -> "(" ^ m ^ ")" | None -> "")
+
+let differences ~current (st : Schema.t) live keys =
+  let schema_of (t : Schema.table) = Option.value t.schema ~default:current in
+  let label schema table =
+    if schema = current then table else schema ^ "." ^ table
+  in
+  (* Only the schemas the migrations put tables in are theirs to describe. *)
+  let schemas =
+    List.sort_uniq compare (current :: List.map schema_of st.tables)
+  in
+  let live =
+    List.filter
+      (fun ((s, t), _) -> List.mem s schemas && t <> "qb_migrations")
+      live
+  in
+  let live_tables = List.sort_uniq compare (List.map fst live) in
+  let wanted =
+    List.map (fun (t : Schema.table) -> (schema_of t, t.name)) st.tables
+  in
+  let column name (c : Schema.column) (l : live) =
+    let at = name ^ "." ^ c.name in
+    let ty =
+      match (l.udt <> udt_name c.ty, mods_differ c.ty l) with
+      | false, None -> []
+      | true, _ ->
+          [
+            Printf.sprintf "%s: %s in the migrations, %s in the database" at
+              (Schema.type_sql c.ty) l.udt;
+          ]
+      | false, Some mods ->
+          [
+            Printf.sprintf "%s: %s in the migrations, %s%s in the database" at
+              (Schema.type_sql c.ty) l.udt mods;
+          ]
+    in
+    let null =
+      if l.nullable = c.not_null then
+        [
+          (if c.not_null then
+             at ^ ": NOT NULL in the migrations, nullable in the database"
+           else at ^ ": nullable in the migrations, NOT NULL in the database");
+        ]
+      else []
+    in
+    (* Which default isn't compared, only whether there is one: an INSERT
+       that leaves the column out is typed on that. *)
+    let fills = c.has_default || c.generated in
+    let default =
+      if fills = l.filled then []
+      else
+        [
+          (if fills then
+             at ^ ": a default in the migrations, none in the database"
+           else at ^ ": no default in the migrations, one in the database");
+        ]
+    in
+    ty @ null @ default
+  in
+  let key cols =
+    match cols with [] -> "none" | cs -> "(" ^ String.concat ", " cs ^ ")"
+  in
+  let tables =
+    List.concat_map
+      (fun (t : Schema.table) ->
+        let k = (schema_of t, t.name) in
+        let name = label (fst k) (snd k) in
+        if not (List.mem k live_tables) then
+          [ Printf.sprintf "table %s: not in the database" name ]
+        else
+          let cols =
+            List.filter_map
+              (fun (k', c) -> if k' = k then Some c else None)
+              live
+          in
+          let live_key =
+            List.filter_map
+              (fun (k', c) -> if k' = k then Some c else None)
+              keys
+          in
+          List.concat_map
+            (fun (c : Schema.column) ->
+              match List.find_opt (fun l -> l.column = c.name) cols with
+              | None ->
+                  [ Printf.sprintf "%s.%s: not in the database" name c.name ]
+              | Some l -> column name c l)
+            t.columns
+          @ List.filter_map
+              (fun l ->
+                if
+                  List.exists
+                    (fun (c : Schema.column) -> c.name = l.column)
+                    t.columns
+                then None
+                else
+                  Some
+                    (Printf.sprintf "%s.%s: not in the migrations" name l.column))
+              cols
+          @
+          if live_key = t.primary_key then []
+          else
+            [
+              Printf.sprintf
+                "%s: primary key %s in the migrations, %s in the database" name
+                (key t.primary_key) (key live_key);
+            ])
+      st.tables
+  in
+  tables
+  @ List.filter_map
+      (fun ((s, t) as key) ->
+        if List.mem key wanted then None
+        else Some (Printf.sprintf "table %s: not in the migrations" (label s t)))
+      live_tables
+
+let verify (module Db : DB) ms =
+  let* st = schema ms in
+  let* current = db_error (Db.find Q.current_schema ()) in
+  let* live = db_error (Db.collect_list Q.columns ()) in
+  let* keys = db_error (Db.collect_list Q.primary_keys ()) in
+  let live =
+    List.map
+      (fun ( table,
+             ( (column, udt, nullable),
+               ((length, precision, scale), (time_precision, filled)) ) ) ->
+        ( table,
+          {
+            column;
+            udt;
+            nullable;
+            length;
+            precision;
+            scale;
+            time_precision;
+            filled;
+          } ))
+      live
+  in
+  Ok (differences ~current st live keys)
+
+(* ---------- baseline ---------- *)
+
+let baseline ((module Db : DB) as db) ms =
+  let* diffs = verify db ms in
+  if diffs <> [] then Error (`Not_verified diffs)
+  else
+    with_lock db @@ fun () ->
+    let* () = db_error (Db.exec Q.create_table ()) in
+    let* applied = db_error (Db.collect_list Q.applied ()) in
+    let* pending = check ~out_of_order:true ms applied in
+    List.fold_left
+      (fun acc m ->
+        let* acc = acc in
+        if List.mem m.name pending then
+          let* () = db_error (Db.exec Q.record (m.name, checksum m)) in
+          Ok (m.name :: acc)
+        else Ok acc)
+      (Ok []) ms
+    |> Result.map List.rev
+
+(* ---------- embed ---------- *)
+
+(* A {id|quoted string|id} whose closing mark isn't in the text. *)
+let quoted sql =
+  let has sub =
+    let n = String.length sub in
+    let rec go i =
+      i + n <= String.length sql && (String.sub sql i n = sub || go (i + 1))
+    in
+    go 0
+  in
+  let rec pick k =
+    let id = if k = 0 then "sql" else Printf.sprintf "sql%d" k in
+    if has ("|" ^ id ^ "}") then pick (k + 1) else id
+  in
+  let id = pick 0 in
+  Printf.sprintf "{%s|%s|%s}" id sql id
+
+let embed ms =
+  "(* Generated by qb-migrate embed. Do not edit. *)\n\n\
+   let migrations : Qb_migrate.migration list =\n\
+  \  [\n"
+  ^ String.concat ""
+      (List.map
+         (fun m ->
+           Printf.sprintf "    { name = %S; sql = %s };\n" m.name (quoted m.sql))
+         ms)
+  ^ "  ]\n"

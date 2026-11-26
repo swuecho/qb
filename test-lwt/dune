@@ -1,0 +1,16 @@
+(test
+ (name test_qb_lwt)
+ (package qb-lwt)
+ (deps
+  (env_var QB_TEST_PG_URL))
+ (libraries
+  qb
+  qb-lwt
+  alcotest
+  lwt
+  lwt.unix
+  caqti-lwt
+  caqti-lwt.unix
+  caqti-driver-sqlite3
+  caqti-driver-postgresql
+  uri))

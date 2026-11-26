@@ -1,0 +1,22 @@
+(library
+ (name qb_pg_parse)
+ (public_name qb-pg-parse)
+ (libraries angstrom yojson)
+ (foreign_stubs
+  (language c)
+  (names pg_query_stubs)
+  (flags
+   (:standard
+    (:include c_flags.sexp))))
+ (c_library_flags
+  (:include c_library_flags.sexp)))
+
+; The tokenizer qb uses, built into this library too: the two then agree on
+; where a string or a comment ends, and neither depends on the other.
+
+(copy_files# ../../src/sql_tokens.ml)
+
+(rule
+ (targets c_flags.sexp c_library_flags.sexp)
+ (action
+  (run ../config/discover.exe)))

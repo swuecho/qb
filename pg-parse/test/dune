@@ -1,0 +1,55 @@
+; schema_gen.ml is generated from the migrations in schema/, so the test
+; also checks that the generated code compiles.
+
+(rule
+ (targets schema_gen.ml)
+ (deps
+  (glob_files schema/*.sql))
+ (action
+  (run
+   %{exe:../bin/main.exe}
+   gen
+   schema/001_init.sql
+   schema/002_changes.sql
+   -o
+   %{targets})))
+
+; queries_gen.ml is generated from queries.sql, checked against the same
+; migrations; its whole-table rows are Schema_gen's.
+
+(rule
+ (targets queries_gen.ml)
+ (deps
+  queries.sql
+  (glob_files schema/*.sql))
+ (action
+  (run
+   %{exe:../bin/main.exe}
+   queries
+   schema/001_init.sql
+   schema/002_changes.sql
+   -q
+   queries.sql
+   --tables
+   Schema_gen
+   -o
+   %{targets})))
+
+(test
+ (name test_qb_pg_parse)
+ (package qb-pg-parse)
+ (deps
+  queries.sql
+  (glob_files schema/*.sql)
+  (env_var QB_TEST_PG_URL))
+ (libraries
+  qb_pg_parse
+  qb
+  yojson
+  caqti-driver-postgresql
+  alcotest
+  caqti
+  caqti.blocking
+  caqti-driver-sqlite3
+  ptime
+  uri))
