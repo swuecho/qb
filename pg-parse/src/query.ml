@@ -154,6 +154,7 @@ let select schema names s =
   let part k = Option.value (field k s) ~default:`Null in
   List.iter (walk env) (List.concat_map snd froms);
   walk env (part "whereClause");
+  walk env (part "distinctClause");
   walk env (part "targetList");
   let aliases =
     List.filter_map
@@ -269,6 +270,7 @@ let insert schema names s =
       | [] -> fail "INSERT ... SELECT isn't supported: write VALUES"
       | rows ->
           (* Without a column list, the values fill the first columns. *)
+          let explicit_cols = list "cols" s <> [] in
           let width =
             List.fold_left
               (fun w row ->
@@ -278,7 +280,7 @@ let insert schema names s =
               0 rows
           in
           require
-            (if list "cols" s <> [] then cols
+            (if explicit_cols then cols
              else List.filteri (fun i _ -> i < width) cols);
           (* VALUES can't name the table's columns. *)
           let values = { env with scope = [] } in
@@ -291,12 +293,27 @@ let insert schema names s =
               in
               if List.length items > List.length cols then
                 fail "INSERT has more values than columns";
+              if explicit_cols && List.length items < List.length cols then
+                fail "INSERT has fewer values than columns";
               List.iteri (fun i v -> assign values (List.nth cols i) v) items)
             rows)
   | Some _ -> fail "this INSERT isn't supported");
   (match field "onConflictClause" s with
   | None -> ()
   | Some oc ->
+      (match field "infer" oc with
+      | Some inf ->
+          List.iter
+            (fun elt ->
+              match node elt with
+              | Some ("IndexElem", ie) -> (
+                  match str "name" ie with
+                  | Some col -> ignore (table_column src ?at:(loc ie) col)
+                  | None -> Option.iter (walk env) (field "expr" ie))
+              | _ -> ())
+            (list "indexElems" inf);
+          walk env (Option.value (field "whereClause" inf) ~default:`Null)
+      | None -> ());
       let env =
         {
           env with

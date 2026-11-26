@@ -120,7 +120,9 @@ let qb_statements dialect =
       to_sql ~dialect
         (filtered
         |> select [ Users.id; Users.name ]
-        |> order_by [ asc Users.name; desc Users.age ]
+        |> distinct
+        |> order_by
+             [ asc Users.name |> nulls_first; desc Users.age |> nulls_last ]
         |> limit 10 |> offset 20) );
     ("select all_rows", to_sql ~dialect (users |> where all_rows));
     ("count", count_sql ~dialect filtered);
@@ -140,6 +142,19 @@ let qb_statements dialect =
     ( "insert values",
       insert_values_sql ~dialect
         (values Users.table Ops.[ Users.name := "Ann"; Users.age := 30 ]) );
+    ( "insert many values",
+      insert_many_values_sql ~dialect
+        [
+          values Users.table Ops.[ Users.name := "Ann"; Users.age := 30 ];
+          values Users.table
+            Ops.
+              [
+                Users.name := "Bob"; Users.age := 40; Users.email := Some "b@x";
+              ];
+        ] );
+    ( "insert many default values",
+      insert_many_values_sql ~dialect
+        [ values Tickets.table []; values Tickets.table [] ] );
     ("create users", create_table_sql ~dialect Users.table);
     ("create order", create_table_sql ~dialect Order.table);
     ( "order table",
@@ -628,6 +643,14 @@ let query_errors () =
     "INSERT ... SELECT isn't supported: write VALUES";
   message "too many values" "INSERT INTO accounts (email) VALUES (:a, :b)"
     "INSERT has more values than columns";
+  message "too few values" "INSERT INTO accounts (email, nickname) VALUES (:a)"
+    "INSERT has fewer values than columns";
+  message "unknown column in ON CONFLICT"
+    "INSERT INTO accounts (email) VALUES (:a) ON CONFLICT (emial) DO NOTHING"
+    "unknown column accounts.emial (did you mean email?)";
+  message "unknown column in DISTINCT ON"
+    "SELECT DISTINCT ON (emial) id FROM accounts"
+    "unknown column emial (did you mean email?)";
   message "a constant doesn't type a parameter in arithmetic"
     "SELECT email FROM accounts WHERE id = 1 AND :n + 1 > 2"
     "can't work out the type of :n: write a cast, e.g. :n::text";
@@ -703,11 +726,41 @@ let codegen_options () =
   has "int64 column" "id : int64;" int64;
   has "int64 reader" "Qb.Stmt.ret Qb.int64" int64;
   has "shared record" "let by_id ~id : by_email_row Qb.stmt" int64;
-  has "columns in another order: a record of its own" "type emails_row = {" int64;
+  has "columns in another order: a record of its own" "type emails_row = {"
+    int64;
   lacks "no second record for the same columns" "type by_id_row" int64;
   let int = src () in
   has "int by default" "id : int;" int;
-  lacks "no int64 by default" "int64" int
+  lacks "no int64 by default" "int64" int;
+  let q_by_id = List.nth qs 1 in
+  let expr64 = Codegen.query_expr ~bigint:`Int64 st q_by_id in
+  has "query_expr ~bigint:`Int64 arg" "Qb.Stmt.arg Qb.int64 id" expr64;
+  has "query_expr ~bigint:`Int64 row" "Qb.Stmt.ret Qb.int64" expr64;
+  has "query_expr ~bigint:`Int64 type" "(int64 * string) Qb.stmt" expr64;
+  (* POSITION(sub IN :s) is not a list parameter; COALESCE/CASE in WHERE type
+     their parameters during walk. *)
+  let pos_q =
+    ok_or_fail "position"
+      (Query.one st "SELECT position('a' IN :s::text) FROM accounts")
+  in
+  Alcotest.(check bool)
+    "POSITION(... IN :s) is not a list" false (List.hd pos_q.params).list;
+  let coal_q =
+    ok_or_fail "coalesce in where"
+      (Query.one st
+         "SELECT id FROM accounts WHERE COALESCE(nickname, :fallback) IS NOT \
+          NULL")
+  in
+  Alcotest.(check string)
+    "COALESCE in WHERE types param" "text" (List.hd coal_q.params).ty.name;
+  let case_q =
+    ok_or_fail "case in where"
+      (Query.one st
+         "SELECT id FROM accounts WHERE CASE WHEN active THEN nickname ELSE \
+          :fallback END IS NOT NULL")
+  in
+  Alcotest.(check string)
+    "CASE in WHERE types param" "text" (List.hd case_q.params).ty.name
 
 (* Two accounts and three articles, for the generated queries. *)
 let seed_queries ~insert_account ~insert_article =

@@ -296,6 +296,7 @@ CREATE TABLE wide (
     [
       "ALTER TABLE wide ALTER COLUMN code TYPE VARCHAR(20)";
       "ALTER TABLE wide ALTER COLUMN fixed TYPE CHAR(4)";
+      "ALTER TABLE wide ALTER COLUMN one TYPE CHAR(5)";
       "ALTER TABLE wide ALTER COLUMN loose TYPE VARCHAR(9)";
       "ALTER TABLE wide ALTER COLUMN amount TYPE NUMERIC(12, 2)";
       "ALTER TABLE wide ALTER COLUMN whole TYPE NUMERIC(8, 1)";
@@ -310,6 +311,7 @@ CREATE TABLE wide (
     [
       "wide.code: VARCHAR(10) in the migrations, varchar(20) in the database";
       "wide.fixed: CHAR(3) in the migrations, bpchar(4) in the database";
+      "wide.one: CHAR in the migrations, bpchar(5) in the database";
       "wide.loose: VARCHAR in the migrations, varchar(9) in the database";
       "wide.amount: NUMERIC(10,2) in the migrations, numeric(12,2) in the \
        database";

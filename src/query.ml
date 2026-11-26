@@ -183,7 +183,8 @@ type filtered
 type unfiltered
 type plain
 type joined
-type 'r order = Order : ('r, _) col * string -> 'r order
+type nulls = Nulls_default | Nulls_first | Nulls_last
+type 'r order = Order : ('r, _) col * string * nulls -> 'r order
 
 (* What a query returns. [Plain]: a selection of its table's columns.
    [Joined]: a selection of the left table's columns paired with the right
@@ -210,6 +211,7 @@ type ('r, 'a) output =
 type ('r, 'a, 'w) query = {
   table : 'r table;
   out : ('r, 'a) output;
+  distinct : bool;
   where : 'r cond option;
   order : 'r order list;
   limit : int option;
@@ -220,11 +222,14 @@ let from table =
   {
     table;
     out = Plain table.row;
+    distinct = false;
     where = None;
     order = [];
     limit = None;
     offset = None;
   }
+
+let distinct q = { q with distinct = true }
 
 let where cond q =
   let where =
@@ -244,8 +249,10 @@ let select : type r a b w. (r, b) sel -> (r, a, w) query -> (r, b, w) query =
          lost"
   | Plain _ -> { q with out = Plain sel }
 
-let asc c = Order (c, "ASC")
-let desc c = Order (c, "DESC")
+let asc c = Order (c, "ASC", Nulls_default)
+let desc c = Order (c, "DESC", Nulls_default)
+let nulls_first (Order (c, dir, _)) = Order (c, dir, Nulls_first)
+let nulls_last (Order (c, dir, _)) = Order (c, dir, Nulls_last)
 let order_by order q = { q with order }
 
 let limit n q =
@@ -282,7 +289,7 @@ let join ?where right ~on q =
 let left_join ?where right ~on q =
   join_with " LEFT JOIN " right ?where ~on (Sel.Expr (Opt (snd_row right))) q
 
-let lift_order l (Order (c, dir)) = Order (l.lift c, dir)
+let lift_order l (Order (c, dir, nulls)) = Order (l.lift c, dir, nulls)
 
 (* The query as SQL sees it: a joined query becomes a plain query on the
    pair, its where, order and selection lifted onto the left side. *)
@@ -302,6 +309,7 @@ let flatten : type r a w. (r, a, w) query -> a flat =
         {
           table;
           out = Plain (Sel.Expr (Both (lift_sel l left, right_sel)));
+          distinct = q.distinct;
           where = Option.map (lift_cond l) q.where;
           order = List.map (lift_order l) q.order;
           limit = q.limit;
@@ -314,19 +322,38 @@ let not_joined : type r a w. string -> (r, a, w) query -> unit =
   | Joined _ -> invalid_arg (fn ^ ": a join is not a table")
   | Plain _ -> ()
 
+let render_order o (Order (c, dir, nulls)) =
+  match (nulls, o.dialect) with
+  | Nulls_default, _ ->
+      colname o c;
+      str o (" " ^ dir)
+  | Nulls_first, (Postgres | Sqlite) ->
+      colname o c;
+      str o (" " ^ dir ^ " NULLS FIRST")
+  | Nulls_last, (Postgres | Sqlite) ->
+      colname o c;
+      str o (" " ^ dir ^ " NULLS LAST")
+  (* MySQL has no NULLS FIRST / NULLS LAST; sort by IS NULL first. *)
+  | Nulls_first, Mysql ->
+      colname o c;
+      str o " IS NULL DESC, ";
+      colname o c;
+      str o (" " ^ dir)
+  | Nulls_last, Mysql ->
+      colname o c;
+      str o " IS NULL ASC, ";
+      colname o c;
+      str o (" " ^ dir)
+
 let render_select o q cols =
-  str o "SELECT ";
+  str o (if q.distinct then "SELECT DISTINCT " else "SELECT ");
   qualified_names o cols;
   str o " FROM ";
   render_from o q.table [];
   render_where o q.where;
   if q.order <> [] then (
     str o " ORDER BY ";
-    sep o ", "
-      (fun (Order (c, dir)) ->
-        colname o c;
-        str o (" " ^ dir))
-      q.order);
+    sep o ", " (render_order o) q.order);
   match (q.limit, q.offset, o.dialect) with
   | Some n, Some m, _ -> str o (Printf.sprintf " LIMIT %d OFFSET %d" n m)
   | Some n, None, _ -> str o (Printf.sprintf " LIMIT %d" n)
@@ -400,6 +427,79 @@ let render_insert_many o t rows =
       str o ")")
     rows
 
+let render_insert_many_values o vs =
+  match vs with
+  | [] -> invalid_arg "Qb.insert_many_values: no rows"
+  | first :: rest -> (
+      let t = first.vtable in
+      base "Qb: insert_many_values" t;
+      List.iter
+        (fun v ->
+          if v.vtable.tname <> t.tname || v.vtable.tschema <> t.tschema then
+            invalid_arg
+              "Qb.insert_many_values: all rows must be for the same table")
+        rest;
+      o.variadic <- true;
+      let col_names_in_order =
+        let seen = Hashtbl.create 8 in
+        let acc = ref [] in
+        List.iter
+          (fun v ->
+            List.iter
+              (fun (Set (c, _)) ->
+                if not (Hashtbl.mem seen c.name) then (
+                  Hashtbl.add seen c.name ();
+                  acc := c.name :: !acc))
+              v.vassigns)
+          vs;
+        List.rev !acc
+      in
+      match (col_names_in_order, vs) with
+      | [], [ _ ] -> render_insert o t [] []
+      | [], _ -> (
+          match (o.dialect, t.cols) with
+          | Sqlite, _ ->
+              invalid_arg
+                "Qb.insert_many_values: SQLite can't insert multiple \
+                 all-default rows in one statement"
+          | _, [] -> invalid_arg "Qb.insert_many_values: table has no columns"
+          | (Postgres | Mysql), Any first_col :: _ ->
+              str o "INSERT INTO ";
+              str o (table_name o.dialect t);
+              str o " (";
+              name o first_col.name;
+              str o ") VALUES ";
+              sep o ", " (fun _ -> str o "(DEFAULT)") vs)
+      | cols, _ ->
+          str o "INSERT INTO ";
+          str o (table_name o.dialect t);
+          str o " (";
+          sep o ", " (name o) cols;
+          str o ") VALUES ";
+          sep o ", "
+            (fun v ->
+              let lookup cname =
+                List.fold_left
+                  (fun acc (Set (c, value)) ->
+                    if c.name = cname then Some (fun () -> param o c value)
+                    else acc)
+                  None v.vassigns
+              in
+              str o "(";
+              sep o ", "
+                (fun cname ->
+                  match lookup cname with
+                  | Some emit -> emit ()
+                  | None ->
+                      if o.dialect = Sqlite then
+                        invalid_arg
+                          "Qb.insert_many_values: on SQLite every row must set \
+                           the same columns"
+                      else str o "DEFAULT")
+                cols;
+              str o ")")
+            vs)
+
 let render_returning o sel =
   match decoder sel with
   | Dec (_, _, cols) ->
@@ -454,6 +554,14 @@ let insert_returning_sql ?(dialect = Postgres) t assigns returning =
 
 let insert_values_sql ?dialect v =
   insert_returning_sql ?dialect v.vtable v.vassigns v.vtable.row
+
+let insert_many_values_sql ?(dialect = Postgres) vs =
+  match vs with
+  | [] -> invalid_arg "Qb.insert_many_values_sql: no rows"
+  | first :: _ ->
+      sql_of dialect (fun o ->
+          render_insert_many_values o vs;
+          render_returning o first.vtable.row)
 
 let insert_many_sql ?(dialect = Postgres) t rows =
   if rows = [] then invalid_arg "Qb.insert_many_sql: no rows";

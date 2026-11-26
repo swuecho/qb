@@ -24,23 +24,42 @@ let number_params sql =
   let first = ref [] in
   (* Each name, and whether it is used as a list. *)
   let kinds = Hashtbl.create 8 in
-  (* Whether what has been written so far ends with the keyword IN. *)
+  (* Whether what has been written so far ends with the keyword IN (and not
+     the IN of Postgres's [POSITION(sub IN str)]). *)
   let after_in () =
+    let is_space = function ' ' | '\n' | '\t' | '\r' -> true | _ -> false in
     let rec back k =
-      if
-        k > 0
-        &&
-        match Buffer.nth out (k - 1) with
-        | ' ' | '\n' | '\t' | '\r' -> true
-        | _ -> false
-      then back (k - 1)
-      else k
+      if k > 0 && is_space (Buffer.nth out (k - 1)) then back (k - 1) else k
+    in
+    let inside_position before_in =
+      let rec scan k depth =
+        if k <= 0 then false
+        else
+          match Buffer.nth out (k - 1) with
+          | ')' -> scan (k - 1) (depth + 1)
+          | '(' when depth > 0 -> scan (k - 1) (depth - 1)
+          | '(' ->
+              let stop = back (k - 1) in
+              let rec ident_start i =
+                if i > 0 && Sql_tokens.is_ident (Buffer.nth out (i - 1)) then
+                  ident_start (i - 1)
+                else i
+              in
+              let start = ident_start stop in
+              let word =
+                String.lowercase_ascii (Buffer.sub out start (stop - start))
+              in
+              word = "position"
+          | _ -> scan (k - 1) depth
+      in
+      scan before_in 0
     in
     let k = back (Buffer.length out) in
     k >= 2
     && Char.lowercase_ascii (Buffer.nth out (k - 2)) = 'i'
     && Char.lowercase_ascii (Buffer.nth out (k - 1)) = 'n'
     && (k = 2 || not (Sql_tokens.is_ident (Buffer.nth out (k - 3))))
+    && not (inside_position (k - 2))
   in
   let index name =
     let rec go i = function

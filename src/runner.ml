@@ -53,6 +53,11 @@ module type S = sig
   val insert_values :
     db -> 'r values -> ('r, [> Caqti_error.call_or_retrieve ]) result fiber
 
+  val insert_many_values :
+    db ->
+    'r values list ->
+    ('r list, [> Caqti_error.call_or_retrieve ]) result fiber
+
   val update :
     db ->
     'r assign list ->
@@ -293,6 +298,13 @@ struct
             find db ~oneshot:o.variadic sql ps pt pv rt decode)
 
   let insert_values db v = insert_returning db v.vtable v.vassigns v.vtable.row
+
+  let insert_many_values db = function
+    | [] -> B.return (Ok [])
+    | first :: _ as vs ->
+        let o = out_for db in
+        render_insert_many_values o vs;
+        collect db o first.vtable.row
 
   let update db assigns q =
     match assigns with

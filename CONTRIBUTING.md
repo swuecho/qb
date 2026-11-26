@@ -45,6 +45,12 @@ sudo make -C libpg_query install
 If libpg_query is somewhere else, set `LIBPG_QUERY_PREFIX` to the prefix that
 contains its `include/` and `lib/` directories.
 
+The test suites also link against `libsqlite3` and `libpq` (via
+`caqti-driver-sqlite3` and `caqti-driver-postgresql`); `opam install . --deps-only --with-test`
+installs their system packages automatically where depexts are enabled (e.g.
+`libsqlite3-dev` and `libpq-dev` on Debian/Ubuntu, or `brew install libpq sqlite`
+on macOS).
+
 PostgreSQL is only needed for the Postgres test suite. The simplest way to get
 one is Docker:
 

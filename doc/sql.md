@@ -93,6 +93,7 @@ stanza.
 | --- | --- |
 | `-qb-schema PATH` | A `.sql` file, or a directory whose `*.sql` files are replayed in file-name order. Repeat it to replay several, in the order given. Required. |
 | `-qb-tables MODULE` | The module holding `qb-pg-parse gen`'s output for the same schema. Optional; see [Rows](#rows). |
+| `-qb-bigint TYPE` | The OCaml type `BIGINT` is read as: `int` (the default) or `int64`. Match `--bigint` if you pass it to `qb-pg-parse gen`. |
 
 A relative `PATH` is looked for in the folder of the file being compiled,
 then in each folder above it, up to the project root (the folder with
@@ -531,6 +532,7 @@ As a dune rule:
 | `FILE...` | The schema files, replayed in the order given. |
 | `-q FILE` | A file of queries. Repeat for several. |
 | `--tables MODULE` | As `-qb-tables`. |
+| `--bigint TYPE` | `int` (the default) or `int64` for `BIGINT` columns. |
 | `-o FILE` | Where to write; standard output by default. |
 
 Compared with `[%sql]`: parameters are labelled arguments rather than
@@ -591,7 +593,7 @@ let authors_without_books min_year : string Qb.stmt =
 queries` does it as a command. Nothing connects to a database.
 
 What it deliberately doesn't have is Postgres's catalog of functions and
-operators. That is why `avg(x)` or `lower(s)` need a cast: a short, visible
+operators. That is why `avg(x)` or `soundex(s)` need a cast: a short, visible
 annotation rather than a table of thousands of signatures to keep right.
 
 ## Troubleshooting

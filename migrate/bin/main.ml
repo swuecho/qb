@@ -114,6 +114,13 @@ let new_ dir name =
        then Ok ()
        else Error "a migration's name is letters, digits, _ and -"
      in
+     let* () =
+       if Sys.file_exists dir then Ok ()
+       else
+         match Sys.mkdir dir 0o755 with
+         | () -> Ok ()
+         | exception Sys_error m -> Error ("can't create " ^ dir ^ ": " ^ m)
+     in
      let* ms = migrations dir in
      let prefix (m : Qb_migrate.migration) =
        let n = String.length m.name in
@@ -125,7 +132,11 @@ let new_ dir name =
      in
      let prefixes = List.filter (( <> ) "") (List.map prefix ms) in
      let next =
-       1 + List.fold_left (fun a p -> max a (int_of_string p)) 0 prefixes
+       1
+       + List.fold_left
+           (fun a p ->
+             match int_of_string_opt p with Some n -> max a n | None -> a)
+           0 prefixes
      in
      let width =
        List.fold_left (fun a p -> max a (String.length p)) 3 prefixes

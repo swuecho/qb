@@ -48,14 +48,29 @@ jobs:
           ocaml-compiler: ${{ matrix.ocaml-version }}
           dune-cache: true
 
+      - name: Cache libpg_query
+        id: cache-libpg-query
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/libpg_query
+          key: libpg_query-${{ runner.os }}-${{ env.LIBPG_QUERY_VERSION }}
+
       - name: Install libpg_query
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bzip2
-          git clone --depth 1 --branch "$LIBPG_QUERY_VERSION" \
-            https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
-          make -C /tmp/libpg_query -j"$(nproc)" build
-          sudo make -C /tmp/libpg_query install
+          if [ "${{ steps.cache-libpg-query.outputs.cache-hit }}" != "true" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends bzip2
+            git clone --depth 1 --branch "$LIBPG_QUERY_VERSION" \
+              https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
+            make -C /tmp/libpg_query -j"$(nproc)" build
+            sudo make -C /tmp/libpg_query install
+            mkdir -p ~/.cache/libpg_query/include ~/.cache/libpg_query/lib
+            cp -a /usr/local/include/pg_query.h ~/.cache/libpg_query/include/
+            cp -a /usr/local/lib/libpg_query.* ~/.cache/libpg_query/lib/
+          else
+            sudo cp -a ~/.cache/libpg_query/include/. /usr/local/include/
+            sudo cp -a ~/.cache/libpg_query/lib/. /usr/local/lib/
+          fi
           sudo ldconfig
 
       - name: Install dependencies

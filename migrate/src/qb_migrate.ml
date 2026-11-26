@@ -361,6 +361,7 @@ let mods_differ (ty : Schema.pg_type) (l : live) =
     else
       match (ty.name, ty.mods) with
       | "varchar", [] -> (None, some l.length)
+      | "bpchar", [] -> (Some "1", some l.length)
       | ("varchar" | "bpchar"), [ n ] -> (Some (string_of_int n), some l.length)
       | "numeric", [] ->
           ( None,

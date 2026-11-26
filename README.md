@@ -158,10 +158,11 @@ Each module also gets the CRUD helpers:
   `first`, `update` or `delete`:
   `Qb.Blocking.update db Qb.Ops.[ Users.name := "Ann" ] (Users.by_pk id)`.
 
-Column types map to qb's exactly where they can (`BIGINT` to `Qb.int`,
-`TIMESTAMPTZ` to `Qb.ptime`, ...); others such as `INTEGER` or `VARCHAR(80)`
-get their own `Qb.ty`, so `Qb.create_table_sql` gives back the same table.
-`NUMERIC`, arrays and other types with no OCaml counterpart are read as text.
+Column types map to qb's exactly where they can (`BIGINT` to `Qb.int`, or
+`Qb.int64` with `--bigint int64` / `-qb-bigint int64`, `TIMESTAMPTZ` to
+`Qb.ptime`, ...); others such as `INTEGER` or `VARCHAR(80)` get their own
+`Qb.ty`, so `Qb.create_table_sql` gives back the same table. `NUMERIC`, arrays
+and other types with no OCaml counterpart are read as text.
 
 From OCaml, `Qb_pg_parse.Pg.check ~caqti:true` checks the text of any
 statement qb renders (`Qb.to_sql`, `Qb.insert_sql`, `Qb.update_sql`, ...); the
@@ -276,7 +277,9 @@ migrations into a binary.
   many rows changed (`0`: no such row); `update_returning` and
   `delete_returning` read them back. `execute_count` does the same for a
   statement written as SQL.
-- **Many rows.** `insert_many db Users.table rows` is one statement.
+- **Many rows.** `insert_many db Users.table rows` inserts whole rows in one
+  statement; `insert_many_values db rows` does the same for partial `values`
+  rows and returns them with ids and defaults filled in.
 - **Transactions.** `transaction db (fun () -> ...)` commits on `Ok` and
   rolls back on `Error` or an exception. They don't nest, and a nested call
   raises rather than quietly committing the outer one.

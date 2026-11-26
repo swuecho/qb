@@ -196,6 +196,7 @@ module Codegen : sig
       [Error] when two columns of a record would have the same name. *)
 
   val query_expr :
+    ?bigint:[ `Int | `Int64 ] ->
     ?tables:string ->
     ?rows:[ `Tuple | `Object ] ->
     Schema.t ->
@@ -205,6 +206,8 @@ module Codegen : sig
       written ([qb-ppx]). Each parameter [:name] is read from the variable
       [name]. Rows are tuples with an element per column, or the bare value when
       there is one; with [~tables], a [t.*] is one element, that table's row.
+
+      [~bigint] is as for {!ocaml}.
 
       With [~rows:`Object], a row of two columns or more is an object with a
       method per column, named after the column or its [AS]; a [t.*] read as a

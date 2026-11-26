@@ -211,7 +211,71 @@ let test_select () =
       ignore (from Users.table |> limit (-1)));
   Alcotest.check_raises "negative offset"
     (Invalid_argument "Qb.offset: negative offset") (fun () ->
-      ignore (from Users.table |> offset (-1)))
+      ignore (from Users.table |> offset (-1)));
+  check_sql "distinct" {|SELECT DISTINCT "age" FROM "users"|}
+    (from Users.table |> select (col Users.age) |> distinct);
+  check_sql "nulls_first and nulls_last on Postgres"
+    {|SELECT "id" FROM "users" ORDER BY "email" ASC NULLS FIRST, "age" DESC NULLS LAST|}
+    (from Users.table |> select [ Users.id ]
+    |> order_by [ asc Users.email |> nulls_first; desc Users.age |> nulls_last ]
+    );
+  Alcotest.(check string)
+    "nulls_first and nulls_last on SQLite"
+    {|SELECT "id" FROM "users" ORDER BY "email" ASC NULLS FIRST, "age" DESC NULLS LAST|}
+    (to_sql ~dialect:Sqlite
+       (from Users.table |> select [ Users.id ]
+       |> order_by
+            [ asc Users.email |> nulls_first; desc Users.age |> nulls_last ]));
+  Alcotest.(check string)
+    "nulls_first and nulls_last on MySQL"
+    "SELECT `id` FROM `users` ORDER BY `email` IS NULL DESC, `email` ASC, \
+     `age` IS NULL ASC, `age` DESC"
+    (to_sql ~dialect:Mysql
+       (from Users.table |> select [ Users.id ]
+       |> order_by
+            [ asc Users.email |> nulls_first; desc Users.age |> nulls_last ]));
+  Alcotest.(check string)
+    "insert_many_values homogeneous"
+    {|INSERT INTO "users" ("name", "age") VALUES (?, ?), (?, ?) RETURNING "id", "name", "age", "email"|}
+    (insert_many_values_sql
+       [
+         values Users.table Ops.[ Users.name := "Ann"; Users.age := 34 ];
+         values Users.table Ops.[ Users.name := "Bob"; Users.age := 51 ];
+       ]);
+  Alcotest.(check string)
+    "insert_many_values heterogeneous uses DEFAULT on Postgres"
+    {|INSERT INTO "users" ("name", "age", "email") VALUES (?, ?, DEFAULT), (?, ?, ?) RETURNING "id", "name", "age", "email"|}
+    (insert_many_values_sql
+       [
+         values Users.table Ops.[ Users.name := "Ann"; Users.age := 34 ];
+         values Users.table
+           Ops.
+             [ Users.name := "Bob"; Users.age := 51; Users.email := Some "b@x" ];
+       ]);
+  Alcotest.check_raises "insert_many_values heterogeneous rejected on SQLite"
+    (Invalid_argument
+       "Qb.insert_many_values: on SQLite every row must set the same columns")
+    (fun () ->
+      ignore
+        (insert_many_values_sql ~dialect:Sqlite
+           [
+             values Users.table Ops.[ Users.name := "Ann"; Users.age := 34 ];
+             values Users.table
+               Ops.
+                 [
+                   Users.name := "Bob";
+                   Users.age := 51;
+                   Users.email := Some "b@x";
+                 ];
+           ]));
+  Alcotest.(check string)
+    "insert_many_values all-default rows on Postgres"
+    {|INSERT INTO "tickets" ("id") VALUES (DEFAULT), (DEFAULT) RETURNING "id"|}
+    (insert_many_values_sql
+       [ values Tickets.table []; values Tickets.table [] ]);
+  Alcotest.check_raises "insert_many_values_sql empty"
+    (Invalid_argument "Qb.insert_many_values_sql: no rows") (fun () ->
+      ignore (insert_many_values_sql []))
 
 let test_join_sql () =
   check_sql
@@ -386,6 +450,21 @@ let test_read db =
        (from Users.table
        |> order_by [ asc Users.id ]
        |> offset 1 |> Blocking.all db));
+  Alcotest.(check (list (option string)))
+    "distinct" [ None; Some "ann@x.org" ]
+    (ok
+       (from Users.table
+       |> select (col Users.email)
+       |> distinct
+       |> order_by [ asc Users.email |> nulls_first ]
+       |> Blocking.all db));
+  Alcotest.(check (list string))
+    "nulls_last" [ "Ann"; "Bob"; "Cy" ]
+    (ok
+       (from Users.table
+       |> select (col Users.name)
+       |> order_by [ asc Users.email |> nulls_last; asc Users.id ]
+       |> Blocking.all db));
   Alcotest.(check (list string))
     "null emails" [ "Bob"; "Cy" ]
     (ok
@@ -513,7 +592,22 @@ let test_insert_returning db =
           (values Users.table Ops.[ Users.name := "Gus"; Users.age := 7 ])));
   Alcotest.(check int)
     "insert_values with no columns" 2
-    (ok (Blocking.insert_values db (values Tickets.table [])))
+    (ok (Blocking.insert_values db (values Tickets.table [])));
+  Alcotest.(check (list user))
+    "insert_many_values empty" []
+    (ok (Blocking.insert_many_values db []));
+  Alcotest.(check (list user))
+    "insert_many_values returns stored rows with assigned ids"
+    [
+      { Users.id = 5; name = "Hal"; age = 22; email = None };
+      { Users.id = 6; name = "Ivy"; age = 28; email = None };
+    ]
+    (ok
+       (Blocking.insert_many_values db
+          [
+            values Users.table Ops.[ Users.name := "Hal"; Users.age := 22 ];
+            values Users.table Ops.[ Users.name := "Ivy"; Users.age := 28 ];
+          ]))
 
 let test_update_delete db =
   seed db;

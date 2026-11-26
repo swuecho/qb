@@ -30,3 +30,18 @@ The search stops at the project root: a schema above it isn't found.
   $ expands out.ml
   0
   qb: schema: schema: No such file or directory (is it in preprocessor_deps?)
+
+An empty migrations folder says so directly, rather than claiming -qb-schema
+was omitted.
+
+  $ mkdir -p proj/empty_schema
+  $ (cd proj && ../driver.exe -qb-schema empty_schema -impl src/area/q.ml -o ../out.ml)
+  $ expands out.ml
+  0
+  qb: schema: no *.sql files found in empty_schema
+
+-qb-bigint int64 reads BIGINT parameters and columns as int64.
+
+  $ (cd proj && ../driver.exe -qb-schema schema -qb-bigint int64 -impl src/area/q.ml -o ../out.ml)
+  $ grep -c 'Qb\.int64' out.ml
+  1

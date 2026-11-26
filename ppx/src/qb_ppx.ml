@@ -6,6 +6,7 @@ open Qb_pg_parse
 
 let schema_paths = ref []
 let tables = ref None
+let bigint = ref `Int
 
 let () =
   Driver.add_arg "-qb-schema"
@@ -19,7 +20,12 @@ let () =
     (Arg.String (fun m -> tables := Some m))
     ~doc:
       "MODULE The module holding the tables qb-pg-parse gen wrote for the same \
-       schema; t.* then reads that table's row type."
+       schema; t.* then reads that table's row type.";
+  Driver.add_arg "-qb-bigint"
+    (Arg.Symbol
+       ( [ "int"; "int64" ],
+         fun s -> bigint := if s = "int64" then `Int64 else `Int ))
+    ~doc:"TYPE The OCaml type BIGINT is read as: int (the default) or int64."
 
 (* Where a relative path is looked for: the folder of the file being
    compiled, then each one above it, up to the project root. That root is the
@@ -68,26 +74,33 @@ let sql_files ~dir path =
   else [ path ]
 
 let load ~dir =
-  match List.concat_map (sql_files ~dir) !schema_paths with
-  | [] ->
-      Error
-        "no schema to check against: give the migrations in dune, e.g. \
-         (preprocess (pps qb-ppx -- -qb-schema migrations)) with \
-         (preprocessor_deps (source_tree migrations))"
-  | files ->
-      List.fold_left
-        (fun st file ->
-          Result.bind st (fun st ->
-              match In_channel.with_open_bin file In_channel.input_all with
-              | exception Sys_error m ->
-                  Error
-                    (Printf.sprintf "schema: %s (is it in preprocessor_deps?)" m)
-              | sql -> (
-                  let sql = Pg.strip_psql_meta sql in
-                  match Schema.apply_sql ~init:st sql with
-                  | Ok st -> Ok st
-                  | Error e -> Error (file ^ ": " ^ Pg.error_to_string ~sql e))))
-        (Ok Schema.empty) files
+  if !schema_paths = [] then
+    Error
+      "no schema to check against: give the migrations in dune, e.g. \
+       (preprocess (pps qb-ppx -- -qb-schema migrations)) with \
+       (preprocessor_deps (source_tree migrations))"
+  else
+    match List.concat_map (sql_files ~dir) !schema_paths with
+    | [] ->
+        Error
+          (Printf.sprintf "schema: no *.sql files found in %s"
+             (String.concat ", " !schema_paths))
+    | files ->
+        List.fold_left
+          (fun st file ->
+            Result.bind st (fun st ->
+                match In_channel.with_open_bin file In_channel.input_all with
+                | exception Sys_error m ->
+                    Error
+                      (Printf.sprintf "schema: %s (is it in preprocessor_deps?)"
+                         m)
+                | sql -> (
+                    let sql = Pg.strip_psql_meta sql in
+                    match Schema.apply_sql ~init:st sql with
+                    | Ok st -> Ok st
+                    | Error e -> Error (file ^ ": " ^ Pg.error_to_string ~sql e)
+                    )))
+          (Ok Schema.empty) files
 
 (* Read once per directory; a run of the rewriter is usually one file. *)
 let schemas = Hashtbl.create 1
@@ -172,7 +185,9 @@ let expand rows ~ctxt sql str_loc delim =
           in
           error ~loc "%s" e.message
       | Ok q -> (
-          match Codegen.query_expr ?tables:!tables ~rows st q with
+          match
+            Codegen.query_expr ~bigint:!bigint ?tables:!tables ~rows st q
+          with
           | exception Invalid_argument m -> error ~loc "qb: %s" m
           | src ->
               let params =

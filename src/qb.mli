@@ -296,8 +296,20 @@ val select :
     {!join}: it picks the left table's columns. After a join it doesn't
     type-check, since replacing the result would drop the right table. *)
 
+val distinct : ('r, 'a, 'w) query -> ('r, 'a, 'w) query
+(** Keeps only distinct result rows ([SELECT DISTINCT]). Applies to {!S.all} and
+    {!S.first}; {!S.count} still counts all matching rows. *)
+
 val asc : ('r, _) col -> 'r order
 val desc : ('r, _) col -> 'r order
+
+val nulls_first : 'r order -> 'r order
+(** Sorts NULL values before non-null values ([NULLS FIRST] on Postgres and
+    SQLite; [col IS NULL DESC, col ...] on MySQL). *)
+
+val nulls_last : 'r order -> 'r order
+(** Sorts NULL values after non-null values ([NULLS LAST] on Postgres and
+    SQLite; [col IS NULL ASC, col ...] on MySQL). *)
 
 val order_by : 'r order list -> ('r, 'a, 'w) query -> ('r, 'a, 'w) query
 (** Replaces the order. On a joined query it takes the left table's columns. *)
@@ -443,6 +455,10 @@ val insert_returning_sql :
 
 val insert_values_sql : ?dialect:dialect -> 'r values -> string
 
+val insert_many_values_sql : ?dialect:dialect -> 'r values list -> string
+(** Raises [Invalid_argument] with no rows; {!S.insert_many_values} runs nothing
+    then. *)
+
 val insert_many_sql : ?dialect:dialect -> 'r table -> 'r list -> string
 (** Raises [Invalid_argument] with no rows; {!S.insert_many} runs nothing then.
 *)
@@ -538,9 +554,8 @@ module Stmt : sig
 end
 
 val stmt_name : _ stmt -> string option
-(** The [?name] given to {!Stmt.make}: what the statement is called in logs
-    and traces. [qb-pg-parse queries] names each statement after its
-    [-- name:]. *)
+(** The [?name] given to {!Stmt.make}: what the statement is called in logs and
+    traces. [qb-pg-parse queries] names each statement after its [-- name:]. *)
 
 val stmt_sql : ?dialect:dialect -> _ stmt -> string
 (** The text a statement is sent as, with its lists spelled out. [dialect]
@@ -617,8 +632,8 @@ val is_unique_violation :
       becomes; a refusal no declared constraint matches is returned as the Caqti
       error it was.
 
-    Messages are Ecto's, in English; match on {!Changeset.type-kind} to word them
-    your own way. *)
+    Messages are Ecto's, in English; match on {!Changeset.type-kind} to word
+    them your own way. *)
 
 module Changeset : sig
   type 'r t
@@ -831,6 +846,16 @@ module type S = sig
   (** Inserts a new row and returns it whole, as the database stored it: ids,
       defaults and all. Not supported by MySQL. *)
 
+  val insert_many_values :
+    db ->
+    'r values list ->
+    ('r list, [> Caqti_error.call_or_retrieve ]) result fiber
+  (** Inserts several new rows in one statement, leaving out columns the
+      database fills in (identities, defaults, NULL), and returns the stored
+      rows. With no rows it does nothing and returns [[]]. On Postgres, rows may
+      set different subsets of columns (omitted ones use [DEFAULT]); on SQLite,
+      every row must set the same columns. Not supported by MySQL. *)
+
   val update :
     db ->
     'r assign list ->
@@ -927,8 +952,8 @@ module type S = sig
       and returns it as it now is. With no changes, nothing is sent and the row
       comes back as given. [`Invalid cs] as for {!insert_changeset}; [`Stale]:
       the row is no longer in the table. Not supported by MySQL. Raises
-      [Invalid_argument] for a {!Qb.Changeset.for_insert}, or for a table without
-      exactly one primary key column. *)
+      [Invalid_argument] for a {!Qb.Changeset.for_insert}, or for a table
+      without exactly one primary key column. *)
 
   (** {2 Statements written as SQL} *)
 

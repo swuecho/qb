@@ -531,6 +531,9 @@ let rec walk ?(aliases = []) env (j : J.t) =
       | `Assoc [ (_, body) ] ->
           walk ~aliases env (Option.value (field "arg" body) ~default:`Null)
       | _ -> ())
+  | `Assoc [ (("CoalesceExpr" | "CaseExpr"), `Assoc kv) ] as expr ->
+      List.iter (fun (_, v) -> walk ~aliases env v) kv;
+      if aliases = [] then ignore (type_of env expr)
   | `Assoc kv -> List.iter (fun (_, v) -> walk ~aliases env v) kv
   | `List l -> List.iter (walk ~aliases env) l
   | _ -> ()
