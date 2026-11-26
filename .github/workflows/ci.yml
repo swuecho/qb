@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  LIBPG_QUERY_VERSION: "18.1.0"
+  QB_TEST_PG_URL: postgresql://qb:qb@127.0.0.1:5432/qb
+
+jobs:
+  test:
+    name: OCaml ${{ matrix.ocaml-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ocaml-version: ["4.14", "5.4"]
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: qb
+          POSTGRES_PASSWORD: qb
+          POSTGRES_DB: qb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qb -d qb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ matrix.ocaml-version }}
+          dune-cache: true
+
+      - name: Install libpg_query
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bzip2
+          git clone --depth 1 --branch "$LIBPG_QUERY_VERSION" \
+            https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
+          make -C /tmp/libpg_query -j"$(nproc)" build
+          sudo make -C /tmp/libpg_query install
+          sudo ldconfig
+
+      - name: Install dependencies
+        run: opam install . --deps-only --with-test --with-doc --yes
+
+      - name: Build
+        run: opam exec -- dune build @all @install
+
+      - name: Test
+        run: opam exec -- dune runtest
+
+      - name: Build documentation
+        if: matrix.ocaml-version == '5.4'
+        run: opam exec -- dune build @doc
+
+  format:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.4"
+          dune-cache: true
+
+      - name: Install ocamlformat
+        run: opam install ocamlformat.0.29.0 --yes
+
+      - name: Check formatting
+        run: opam exec -- dune build @fmt

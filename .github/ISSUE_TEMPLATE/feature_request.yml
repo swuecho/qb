@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest an addition or a change
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please describe the problem before the
+        proposed API or syntax.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: What are you writing today, and where does it get in the way?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like qb to do?
+      description: A sketch of the API, the SQL, or the behaviour is helpful.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Workarounds you use now, or other designs you considered.
+    validations:
+      required: false

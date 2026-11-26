@@ -5,6 +5,10 @@ description:
   "[%sql \"SELECT ...\"] is checked against your migrations when the file is compiled, and becomes a qb statement whose parameter and row types are worked out from the schema."
 maintainer: ["Hao Wu"]
 authors: ["Hao Wu"]
+license: "MIT"
+tags: ["database" "sql" "ppx" "postgresql"]
+homepage: "https://github.com/swuecho/qb"
+bug-reports: "https://github.com/swuecho/qb/issues"
 depends: [
   "ocaml" {>= "4.14"}
   "dune" {>= "3.0"}
@@ -30,3 +34,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
+dev-repo: "git+https://github.com/swuecho/qb.git"

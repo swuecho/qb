@@ -1,7 +1,14 @@
 # qb
 
+[![CI](https://github.com/swuecho/qb/actions/workflows/ci.yml/badge.svg)](https://github.com/swuecho/qb/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![OCaml](https://img.shields.io/badge/OCaml-%E2%89%A5%204.14-orange)](https://ocaml.org)
+
 A typed, Drizzle-style query builder for single-table CRUD on
 [Caqti](https://github.com/paurkedal/ocaml-caqti).
+
+> **Status:** pre-1.0. The API may still change; questions, issues and pull
+> requests are welcome.
 
 Define a table once (a record type and one column per field) and get typed
 select, insert, update, delete and `CREATE TABLE`. Every column and condition
@@ -58,6 +65,19 @@ let ann = Qb.Blocking.insert_values db Qb.(values Users.table Ops.[ Users.name :
 
 `dune exec ./example/users.exe` runs a full walkthrough on in-memory SQLite
 (it uses labeled tuples, so it builds on OCaml 5.4 and later only).
+
+## Documentation
+
+- [Tutorial](doc/tutorial.md): `[%sql]` from an empty project to three-table
+  queries with aggregates.
+- [SQL reference](doc/sql.md): every typing rule, what is rejected, and each
+  error message.
+- [Migrations reference](doc/migrate.md): how `qb-migrate` applies and verifies
+  migrations.
+- [`example/`](example): runnable examples. `dune exec ./example/join.exe`,
+  `dune exec ./example/users.exe` and `dune exec ./example/sql/main.exe`.
+- The API reference is in the `.mli` files; `dune build @doc` renders it with
+  odoc.
 
 ## Packages
 
@@ -268,24 +288,34 @@ migrations into a binary.
 
 ## Install
 
-From this directory:
+The packages are not on opam yet; pin them from GitHub:
 
 ```sh
-opam pin add qb . --kind=path
-opam pin add qb-lwt . --kind=path   # for Lwt
-opam pin add qb-pg-parse . --kind=path   # tables from migrations
-opam pin add qb-ppx . --kind=path        # [%sql "..."]
-opam pin add qb-migrate . --kind=path    # apply the migrations
+opam pin add qb git+https://github.com/swuecho/qb.git
+opam pin add qb-lwt git+https://github.com/swuecho/qb.git        # for Lwt
+opam pin add qb-pg-parse git+https://github.com/swuecho/qb.git   # tables from migrations
+opam pin add qb-ppx git+https://github.com/swuecho/qb.git        # [%sql "..."]
+opam pin add qb-migrate git+https://github.com/swuecho/qb.git    # apply the migrations
 ```
 
+From a checkout, pass `.` instead of the URL. The packages need OCaml 4.14 or
+later and dune 3.0; `qb` currently targets Caqti 2.x (`>= 2.3` and `< 3.0`).
 You also need a Caqti driver, such as `caqti-driver-sqlite3` or
 `caqti-driver-postgresql`.
+
+`qb-pg-parse` and `qb-ppx` additionally need
+[libpg_query](https://github.com/pganalyze/libpg_query) at build time:
+`brew install libpg_query` on macOS, or build it from source. If it is not in
+`/usr/local`, set `LIBPG_QUERY_PREFIX` to the directory holding its `include/`
+and `lib/`. `qb-migrate` also needs a PostgreSQL database at run time.
 
 ## Develop
 
 ```sh
 dune build
 dune test                 # SQL rendering and SQLite
+dune build @fmt           # check formatting (ocamlformat 0.29.0)
+dune build @doc           # build the odoc documentation
 scripts/test-pg.sh        # the same, plus Postgres in a throwaway Docker container
 ```
 
@@ -303,3 +333,17 @@ QB_TEST_PG_URL=postgresql://user:pass@localhost/db dune test --force
   a join's conditions are decided at run time or the database isn't
   Postgres, and `[%sql]` for every other join.
 - `insert_returning` needs `RETURNING`, which MySQL lacks.
+
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+development setup, test commands and release process.
+
+## License
+
+qb is released under the [MIT License](LICENSE).
+
+`qb-pg-parse` links against
+[libpg_query](https://github.com/pganalyze/libpg_query), which is distributed
+under its own BSD-style license. Caqti and the database drivers have their own
+licenses.

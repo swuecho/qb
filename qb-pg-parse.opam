@@ -6,6 +6,10 @@ description:
   "Binds libpg_query, the parser extracted from Postgres, to check SQL, read CREATE TABLE and ALTER TABLE migrations into a schema, and generate qb table modules from it. Needs libpg_query installed (e.g. brew install libpg_query); set LIBPG_QUERY_PREFIX if it is somewhere unusual."
 maintainer: ["Hao Wu"]
 authors: ["Hao Wu"]
+license: "MIT"
+tags: ["database" "sql" "parser" "postgresql" "codegen"]
+homepage: "https://github.com/swuecho/qb"
+bug-reports: "https://github.com/swuecho/qb/issues"
 depends: [
   "ocaml" {>= "4.14"}
   "dune" {>= "3.0"}
@@ -33,3 +37,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
+dev-repo: "git+https://github.com/swuecho/qb.git"

@@ -1,0 +1,63 @@
+name: Bug report
+description: Something does not work as documented
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A small reproduction goes a long way.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead? Include the full error output if there is one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How can we reproduce it?
+      description: A table definition, query, migration, or a link to a repository.
+      render: ocaml
+    validations:
+      required: true
+
+  - type: input
+    id: ocaml
+    attributes:
+      label: OCaml version
+      placeholder: "5.4.1"
+    validations:
+      required: true
+
+  - type: input
+    id: qb
+    attributes:
+      label: qb version or commit
+      placeholder: "0.1.0, or the output of git rev-parse --short HEAD"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: database
+    attributes:
+      label: Database and driver
+      options:
+        - PostgreSQL / caqti-driver-postgresql
+        - SQLite / caqti-driver-sqlite3
+        - MariaDB or MySQL / caqti-driver-mariadb or caqti-driver-mysql
+        - None, the problem is at compile time
+        - Other (please say in the description)
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Logs, stack traces, or other context.
+    validations:
+      required: false

@@ -1,2 +1,14 @@
-_build
+_build/
+_opam/
 *.install
+
+# Editor and OS noise
+.merlin
+*.merlin
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Local environment
+.env

@@ -5,12 +5,16 @@ description:
   "Runs migrations/*.sql in order, each once and in a transaction, records them in a qb_migrations table, and checks that the database matches the schema [%sql] was compiled against. A library to call when a program starts, and the qb-migrate command."
 maintainer: ["Hao Wu"]
 authors: ["Hao Wu"]
+license: "MIT"
+tags: ["database" "migrations" "postgresql"]
+homepage: "https://github.com/swuecho/qb"
+bug-reports: "https://github.com/swuecho/qb/issues"
 depends: [
   "ocaml" {>= "4.14"}
   "dune" {>= "3.0"}
   "qb-pg-parse" {= version}
-  "caqti" {>= "2.3"}
-  "caqti-driver-postgresql"
+  "caqti" {>= "2.3" & < "3.0"}
+  "caqti-driver-postgresql" {>= "2.3" & < "3.0"}
   "ptime"
   "uri"
   "cmdliner" {>= "1.1"}
@@ -31,3 +35,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
+dev-repo: "git+https://github.com/swuecho/qb.git"
