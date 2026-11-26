@@ -160,17 +160,18 @@ struct
       | `Mysql -> Mysql
       | _ -> Postgres)
 
-  (* One debug line for each statement, once it has run: its text, its
-     parameters, what came of it and how long it took. Nothing is timed or
-     formatted unless the source is at debug level. *)
-  let logged sql params describe run =
+  (* One debug line for each statement, once it has run: its name (if any),
+     its text, its parameters, what came of it and how long it took. Nothing is
+     timed or formatted unless the source is at debug level. *)
+  let logged ?name sql params describe run =
     if Logs.Src.level Cache.src <> Some Logs.Debug then run ()
     else
       let clock = Mtime_clock.counter () in
+      let prefix = match name with Some n -> "[" ^ n ^ "] " | None -> "" in
       run ()
       |> B.map (fun r ->
           Cache.Log.debug (fun m ->
-              m "%s%a -> %s, %a" sql Cache.pp_params params
+              m "%s%s%a -> %s, %a" prefix sql Cache.pp_params params
                 (match r with
                 | Ok x -> describe x
                 | Error (#Caqti_error.call_or_retrieve as e) ->
@@ -194,8 +195,8 @@ struct
 
   (* Every driver qb renders for counts affected rows; one that can't says
      so as an error of the usual kind. *)
-  let counted (module Db : B.CONNECTION) ~oneshot sql ps pt pv =
-    logged sql ps
+  let counted ?name (module Db : B.CONNECTION) ~oneshot sql ps pt pv =
+    logged ?name sql ps
       (fun n -> rows n ^ " changed")
       (fun () ->
         Db.exec_with_affected_count
@@ -213,22 +214,24 @@ struct
     match Cache.finish o with
     | sql, ps, Pack (pt, pv) -> counted db ~oneshot:o.variadic sql ps pt pv
 
-  let collect_list (module Db : B.CONNECTION) ~oneshot sql ps pt pv rt decode =
-    logged sql ps
+  let collect_list ?name (module Db : B.CONNECTION) ~oneshot sql ps pt pv rt
+      decode =
+    logged ?name sql ps
       (fun l -> rows (List.length l))
       (fun () ->
         Db.collect_list (Cache.request ~oneshot Cache.zero_or_more pt rt sql) pv)
     |> B.map (Result.map (List.map decode))
 
-  let find_opt (module Db : B.CONNECTION) ~oneshot sql ps pt pv rt decode =
-    logged sql ps
+  let find_opt ?name (module Db : B.CONNECTION) ~oneshot sql ps pt pv rt decode
+      =
+    logged ?name sql ps
       (function Some _ -> "1 row" | None -> "no row")
       (fun () ->
         Db.find_opt (Cache.request ~oneshot Cache.zero_or_one pt rt sql) pv)
     |> B.map (Result.map (Option.map decode))
 
-  let find (module Db : B.CONNECTION) ~oneshot sql ps pt pv rt decode =
-    logged sql ps
+  let find ?name (module Db : B.CONNECTION) ~oneshot sql ps pt pv rt decode =
+    logged ?name sql ps
       (fun _ -> "1 row")
       (fun () -> Db.find (Cache.request ~oneshot Cache.one pt rt sql) pv)
     |> B.map (Result.map decode)
@@ -404,22 +407,23 @@ struct
   let fetch_all db s =
     match (s.row, pack_args (out_for db).dialect s) with
     | Row_dec (rt, decode), (sql, ps, Pack (pt, pv)) ->
-        collect_list db ~oneshot:(variadic s) sql ps pt pv rt decode
+        collect_list ?name:s.name db ~oneshot:(variadic s) sql ps pt pv rt
+          decode
 
   let fetch_opt db s =
     match (s.row, pack_args (out_for db).dialect s) with
     | Row_dec (rt, decode), (sql, ps, Pack (pt, pv)) ->
-        find_opt db ~oneshot:(variadic s) sql ps pt pv rt decode
+        find_opt ?name:s.name db ~oneshot:(variadic s) sql ps pt pv rt decode
 
   let fetch_one db s =
     match (s.row, pack_args (out_for db).dialect s) with
     | Row_dec (rt, decode), (sql, ps, Pack (pt, pv)) ->
-        find db ~oneshot:(variadic s) sql ps pt pv rt decode
+        find ?name:s.name db ~oneshot:(variadic s) sql ps pt pv rt decode
 
   let execute ((module Db : B.CONNECTION) as db) s =
     match pack_args (out_for db).dialect s with
     | sql, ps, Pack (pt, pv) ->
-        logged sql ps
+        logged ?name:s.name sql ps
           (fun () -> "done")
           (fun () ->
             Db.exec
@@ -429,7 +433,8 @@ struct
 
   let execute_count db s =
     match pack_args (out_for db).dialect s with
-    | sql, ps, Pack (pt, pv) -> counted db ~oneshot:(variadic s) sql ps pt pv
+    | sql, ps, Pack (pt, pv) ->
+        counted ?name:s.name db ~oneshot:(variadic s) sql ps pt pv
 end
 
 module Make (B : BACKEND) =

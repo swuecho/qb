@@ -247,8 +247,14 @@ let select : type r a b w. (r, b) sel -> (r, a, w) query -> (r, b, w) query =
 let asc c = Order (c, "ASC")
 let desc c = Order (c, "DESC")
 let order_by order q = { q with order }
-let limit n q = { q with limit = Some n }
-let offset n q = { q with offset = Some n }
+
+let limit n q =
+  if n < 0 then invalid_arg "Qb.limit: negative limit";
+  { q with limit = Some n }
+
+let offset n q =
+  if n < 0 then invalid_arg "Qb.offset: negative offset";
+  { q with offset = Some n }
 
 (* A join is recorded in the query's output; see [output]. The right
    table's own condition goes into the ON, which for a left join is also what
@@ -321,8 +327,15 @@ let render_select o q cols =
         colname o c;
         str o (" " ^ dir))
       q.order);
-  Option.iter (fun n -> str o (Printf.sprintf " LIMIT %d" n)) q.limit;
-  Option.iter (fun n -> str o (Printf.sprintf " OFFSET %d" n)) q.offset
+  match (q.limit, q.offset, o.dialect) with
+  | Some n, Some m, _ -> str o (Printf.sprintf " LIMIT %d OFFSET %d" n m)
+  | Some n, None, _ -> str o (Printf.sprintf " LIMIT %d" n)
+  | None, Some m, Postgres -> str o (Printf.sprintf " OFFSET %d" m)
+  (* SQLite and MySQL require LIMIT whenever OFFSET is given. *)
+  | None, Some m, Sqlite -> str o (Printf.sprintf " LIMIT -1 OFFSET %d" m)
+  | None, Some m, Mysql ->
+      str o (Printf.sprintf " LIMIT 18446744073709551615 OFFSET %d" m)
+  | None, None, _ -> ()
 
 (* A SELECT ready to render: Caqti's row type, how to build the result from
    it, and the renderer. *)
@@ -334,7 +347,10 @@ let prepare : type r a w. ?limit:int -> (r, a, w) query -> a prepared =
   match flatten q with
   | Flat q -> (
       let q =
-        match limit with None -> q | Some n -> { q with limit = Some n }
+        match (limit, q.limit) with
+        | None, _ -> q
+        | Some n, None -> { q with limit = Some n }
+        | Some n, Some m -> { q with limit = Some (min n m) }
       in
       match q.out with
       | Joined _ -> assert false (* flatten leaves none *)

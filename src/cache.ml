@@ -117,5 +117,7 @@ let request (type p x) ?(oneshot = false) (c : 'm t) (pt : p Caqti_type.t)
   | Some (Entry (pt', rt', r)) -> (
       match (Caqti_type.unify pt' pt, Caqti_type.unify rt' rt) with
       | Some Caqti_type.Equal, Some Caqti_type.Equal -> r
-      | _ -> fresh ())
+      (* Same SQL with different types: don't replace the cached entry, which
+         would allocate a new prepared statement on every alternating call. *)
+      | _ -> create ~oneshot:true)
   | None -> fresh ()

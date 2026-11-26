@@ -136,7 +136,18 @@ let test_run db =
   strings "the database matches" [] (ok (verify db [ init; books ]));
   let more = m "003_more.sql" "CREATE TABLE more (x INT)" in
   strings "only what is pending" [ "003_more.sql" ]
-    (ok (run db [ init; books; more ]))
+    (ok (run db [ init; books; more ]));
+  let dump =
+    m "004_dump.sql"
+      "SELECT pg_catalog.set_config('search_path', '', false);\n\
+       CREATE TABLE qb_migrate_test.dumped (id INT);"
+  in
+  let after = m "005_after.sql" "CREATE TABLE after_dump (id INT)" in
+  strings "pg_dump search_path reset still records and restores search_path"
+    [ "004_dump.sql"; "005_after.sql" ]
+    (ok (run db [ init; books; more; dump; after ]));
+  strings "verify still passes after search_path reset" []
+    (ok (verify db [ init; books; more; dump; after ]))
 
 let test_refusals db =
   ignore (ok (run db [ init; books ]));

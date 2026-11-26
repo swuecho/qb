@@ -91,14 +91,37 @@ module Q = struct
     (unit ->* t3 string string ptime)
       "SELECT name, checksum, applied_at FROM qb_migrations ORDER BY name"
 
+  let quote_ident name =
+    "\"" ^ String.concat "\"\"" (String.split_on_char '"' name) ^ "\""
+
   let record =
     (t2 string string ->. unit)
       "INSERT INTO qb_migrations (name, checksum) VALUES (?, ?)"
+
+  (* Qualified with the schema captured before the migration ran, so a
+     migration such as a pg_dump that clears search_path can still be
+     recorded. *)
+  let record_in schema =
+    let table = quote_ident schema ^ ".qb_migrations" in
+    Caqti_request.create ~oneshot:true (t2 string string) unit Caqti_mult.zero
+      (fun _ ->
+        Caqti_query.S
+          [
+            Caqti_query.L ("INSERT INTO " ^ table ^ " (name, checksum) VALUES (");
+            Caqti_query.P 0;
+            Caqti_query.L ", ";
+            Caqti_query.P 1;
+            Caqti_query.L ")";
+          ])
 
   (* One key for every qb-migrate run on the database. *)
   let lock = (unit ->! bool) "SELECT true FROM pg_advisory_lock(7126173401)"
   let unlock = (unit ->! bool) "SELECT pg_advisory_unlock(7126173401)"
   let current_schema = (unit ->! string) "SELECT current_schema()::text"
+  let search_path = (unit ->! string) "SHOW search_path"
+
+  let set_search_path =
+    (string ->! string) "SELECT pg_catalog.set_config('search_path', ?, false)"
 
   (* Each column of each table: its type's name, whether it can be NULL,
      the type's length or precision where it has one, and whether the
@@ -222,7 +245,7 @@ let first_line s =
   | Some i -> String.sub s 0 i ^ " ..."
   | None -> s
 
-let apply (module Db : DB) m stmts =
+let apply ~schema ~saved_path (module Db : DB) m stmts =
   let failed stmt e ~kept =
     `Failed
       ( m.name,
@@ -240,23 +263,37 @@ let apply (module Db : DB) m stmts =
         | Ok () -> exec ~kept rest
         | Error e -> Error (failed stmt e ~kept))
   in
-  let record () = db_error (Db.exec Q.record (m.name, checksum m)) in
+  let record () =
+    db_error (Db.exec (Q.record_in schema) (m.name, checksum m))
+  in
+  let restore_path () = ignore (Db.find Q.set_search_path saved_path) in
   if no_transaction m then
-    let* () = exec ~kept:true stmts in
-    record ()
+    Fun.protect ~finally:restore_path (fun () ->
+        let* () = exec ~kept:true stmts in
+        record ())
   else
     let* () = db_error (Db.start ()) in
     match
       let* () = exec ~kept:false stmts in
       record ()
     with
-    | Ok () -> db_error (Db.commit ())
+    | Ok () ->
+        let r = db_error (Db.commit ()) in
+        restore_path ();
+        r
     | Error _ as e ->
         ignore (Db.rollback ());
+        restore_path ();
         e
+    | exception e ->
+        ignore (Db.rollback ());
+        restore_path ();
+        raise e
 
 let run ?(out_of_order = false) ((module Db : DB) as db) ms =
   with_lock db @@ fun () ->
+  let* schema = db_error (Db.find Q.current_schema ()) in
+  let* saved_path = db_error (Db.find Q.search_path ()) in
   let* () = db_error (Db.exec Q.create_table ()) in
   let* applied = db_error (Db.collect_list Q.applied ()) in
   let* pending = check ~out_of_order ms applied in
@@ -273,7 +310,7 @@ let run ?(out_of_order = false) ((module Db : DB) as db) ms =
   List.fold_left
     (fun acc (m, stmts) ->
       let* acc = acc in
-      let* () = apply db m stmts in
+      let* () = apply ~schema ~saved_path db m stmts in
       Ok (m.name :: acc))
     (Ok []) (List.rev parsed)
   |> Result.map List.rev
@@ -491,22 +528,34 @@ let verify (module Db : DB) ms =
 (* ---------- baseline ---------- *)
 
 let baseline ((module Db : DB) as db) ms =
+  with_lock db @@ fun () ->
   let* diffs = verify db ms in
   if diffs <> [] then Error (`Not_verified diffs)
   else
-    with_lock db @@ fun () ->
     let* () = db_error (Db.exec Q.create_table ()) in
     let* applied = db_error (Db.collect_list Q.applied ()) in
     let* pending = check ~out_of_order:true ms applied in
-    List.fold_left
-      (fun acc m ->
-        let* acc = acc in
-        if List.mem m.name pending then
-          let* () = db_error (Db.exec Q.record (m.name, checksum m)) in
-          Ok (m.name :: acc)
-        else Ok acc)
-      (Ok []) ms
-    |> Result.map List.rev
+    let to_record = List.filter (fun m -> List.mem m.name pending) ms in
+    if to_record = [] then Ok []
+    else
+      let* () = db_error (Db.start ()) in
+      match
+        List.fold_left
+          (fun acc m ->
+            let* acc = acc in
+            let* () = db_error (Db.exec Q.record (m.name, checksum m)) in
+            Ok (m.name :: acc))
+          (Ok []) to_record
+      with
+      | Ok recorded ->
+          let* () = db_error (Db.commit ()) in
+          Ok (List.rev recorded)
+      | Error _ as e ->
+          ignore (Db.rollback ());
+          e
+      | exception e ->
+          ignore (Db.rollback ());
+          raise e
 
 (* ---------- embed ---------- *)
 

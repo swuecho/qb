@@ -45,8 +45,8 @@ let until close =
 let string_ = char '\'' *> until_char '\''
 let name = char '"' *> until_char '"'
 
-(* E'...': a backslash escapes the next character. Tried at the start of a
-   word only, so the E of NAME'...' isn't one. *)
+(* E'...': a backslash escapes the next character, and '' is a doubled quote.
+   Tried at the start of a word only, so the E of NAME'...' isn't one. *)
 let e_string =
   (char 'E' <|> char 'e')
   *> char '\''
@@ -54,7 +54,7 @@ let e_string =
       end_of_input
       <|> ( any_char >>= function
             | '\\' -> any_char *> more <|> end_of_input
-            | '\'' -> return ()
+            | '\'' -> char '\'' *> more <|> return ()
             | _ -> more ))
 
 (* $tag$ ... $tag$. A tag doesn't start with a digit, so $1$ isn't one. *)
@@ -64,7 +64,17 @@ let dollar_quoted =
   else until ("$" ^ tag ^ "$")
 
 let line_comment = string "--" *> skip_while (fun c -> c <> '\n')
-let block_comment = string "/*" *> until "*/"
+
+(* Postgres nests block comments: /* outer /* inner */ still comment */. *)
+let block_comment =
+  let rec go depth =
+    end_of_input
+    <|> (string "/*" >>= fun _ -> go (depth + 1))
+    <|> ( string "*/" >>= fun _ ->
+          if depth = 1 then return () else go (depth - 1) )
+    <|> (any_char >>= fun _ -> go depth)
+  in
+  string "/*" >>= fun _ -> go 1
 
 let numbered =
   char '$' *> take_while1 is_digit >>| fun digits ->

@@ -26,7 +26,8 @@ let parse_integer of_string s =
   then of_string s
   else None
 
-(* Decimal only: float_of_string would also take "nan", "inf" and hex. *)
+(* Decimal only: float_of_string would also take "nan", "inf" and hex, and
+   huge exponents overflow to infinity. *)
 let parse_float s =
   let s = String.trim s in
   if
@@ -34,7 +35,10 @@ let parse_float s =
     && String.for_all
          (fun c -> Sql_tokens.is_digit c || String.contains "+-.eE" c)
          s
-  then float_of_string_opt s
+  then
+    match float_of_string_opt s with
+    | Some f when Float.is_finite f -> Some f
+    | _ -> None
   else None
 
 (* The shortest text that reads back as the same float. *)
@@ -57,8 +61,8 @@ let parse_ptime s =
   let s = String.trim s in
   let rfc s =
     match Ptime.of_rfc3339 ~strict:false s with
-    | Ok (t, _, _) -> Some t
-    | Error _ -> None
+    | Ok (t, _, count) when count = String.length s -> Some t
+    | _ -> None
   in
   match rfc s with
   | Some t -> Some t

@@ -39,6 +39,9 @@ let test_quoted () =
   check "an E string and its escapes"
     [ {|quoted E'it\'s ?'|}; "?" ]
     {|E'it\'s ?' ?|};
+  check "an E string with doubled quotes stays escaped"
+    [ {|quoted E'it''s \'?'|}; "?" ]
+    {|E'it''s \'?' ?|};
   check "E at the end of a word starts no escapes"
     [ {|quoted 'a\'|}; "?"; "quoted '" ]
     {|nameE'a\' ?'|};
@@ -54,6 +57,12 @@ let test_comments () =
     [ "comment -- ? $1 :x"; "?" ]
     "a -- ? $1 :x\n?";
   check "a block comment" [ "comment /* ? \n :x */"; ":y" ] "/* ? \n :x */ :y";
+  check "nested block comments"
+    [ "comment /* outer /* inner ? */ :x */"; "?" ]
+    "/* outer /* inner ? */ :x */ ?";
+  check "unclosed nested block comment"
+    [ "comment /* outer /* inner */ ?" ]
+    "/* outer /* inner */ ?";
   check "a minus, a slash" [ "?" ] "a - b / c ?";
   check "a quote in a comment opens nothing" [ "comment -- it's"; "?" ]
     "-- it's\n?"

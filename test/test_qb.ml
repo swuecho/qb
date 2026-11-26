@@ -191,7 +191,27 @@ let test_select () =
          (let+ id = col Users.id and+ name = col Users.name in
           (id, name))
     |> order_by [ asc Users.name; desc Users.id ]
-    |> limit 10 |> offset 20)
+    |> limit 10 |> offset 20);
+  Alcotest.(check string)
+    "offset without limit on Postgres" {|SELECT "id" FROM "users" OFFSET 5|}
+    (to_sql ~dialect:Postgres
+       (from Users.table |> select [ Users.id ] |> offset 5));
+  Alcotest.(check string)
+    "offset without limit on SQLite"
+    {|SELECT "id" FROM "users" LIMIT -1 OFFSET 5|}
+    (to_sql ~dialect:Sqlite
+       (from Users.table |> select [ Users.id ] |> offset 5));
+  Alcotest.(check string)
+    "offset without limit on MySQL"
+    "SELECT `id` FROM `users` LIMIT 18446744073709551615 OFFSET 5"
+    (to_sql ~dialect:Mysql
+       (from Users.table |> select [ Users.id ] |> offset 5));
+  Alcotest.check_raises "negative limit"
+    (Invalid_argument "Qb.limit: negative limit") (fun () ->
+      ignore (from Users.table |> limit (-1)));
+  Alcotest.check_raises "negative offset"
+    (Invalid_argument "Qb.offset: negative offset") (fun () ->
+      ignore (from Users.table |> offset (-1)))
 
 let test_join_sql () =
   check_sql
@@ -357,6 +377,15 @@ let test_read db =
   Alcotest.(check (option user))
     "first by id" (Some bob)
     (ok (from Users.table |> where Ops.(Users.id = 2) |> Blocking.first db));
+  Alcotest.(check (option user))
+    "first respects limit 0" None
+    (ok (from Users.table |> limit 0 |> Blocking.first db));
+  Alcotest.(check (list user))
+    "offset without limit" [ bob; cy ]
+    (ok
+       (from Users.table
+       |> order_by [ asc Users.id ]
+       |> offset 1 |> Blocking.all db));
   Alcotest.(check (list string))
     "null emails" [ "Bob"; "Cy" ]
     (ok
@@ -639,6 +668,13 @@ let test_log db =
            (Blocking.fetch_all db
               (Stmt.make {|SELECT "name" FROM "users" WHERE "name" = $1|}
                  [ Stmt.arg text (String.make 200 'x') ]
+                 (Stmt.ret text))));
+      ignore
+        (ok
+           (Blocking.fetch_opt db
+              (Stmt.make ~name:"by_name"
+                 {|SELECT "name" FROM "users" WHERE "name" = $1|}
+                 [ Stmt.arg text "Ann" ]
                  (Stmt.ret text)))));
   (* "..., 412us" and what the driver says of a failure are left out. *)
   let outcome line =
@@ -663,6 +699,7 @@ let test_log db =
       {|INSERT INTO "users" ("id", "name", "age", "email") VALUES (?, ?, ?, ?) [1, "Ann", 34, "ann@x.org"] -> failed|};
       {|SELECT "name" FROM "users" WHERE "name" = $1 ["|} ^ String.make 76 'x'
       ^ {|...] -> 0 rows|};
+      {|[by_name] SELECT "name" FROM "users" WHERE "name" = $1 ["Ann"] -> 1 row|};
     ]
     (List.rev_map failed !lines);
   lines := [];
@@ -918,13 +955,38 @@ let test_cast () =
     C.(
       for_insert Things.table
       |> cast
-           [ ("id", "0x1f"); ("ratio", "nan"); ("flag", "maybe"); ("big", "1") ]
-           [ field Things.id; field Things.ratio; field Things.flag ])
+           [
+             ("id", "0x1f");
+             ("ratio", "nan");
+             ("flag", "maybe");
+             ("big", "1");
+             ("at", "2026-11-22T10:30:00Z garbage");
+           ]
+           [
+             field Things.id;
+             field Things.ratio;
+             field Things.flag;
+             field Things.at;
+           ])
   in
   Alcotest.(check error_list)
     "cast errors"
-    [ ("id", "is invalid"); ("ratio", "is invalid"); ("flag", "is invalid") ]
+    [
+      ("id", "is invalid");
+      ("ratio", "is invalid");
+      ("flag", "is invalid");
+      ("at", "is invalid");
+    ]
     (errors cs);
+  let cs_inf =
+    C.(
+      for_insert Things.table
+      |> cast [ ("ratio", "1e1000") ] [ field Things.ratio ])
+  in
+  Alcotest.(check error_list)
+    "float overflow is invalid"
+    [ ("ratio", "is invalid") ]
+    (errors cs_inf);
   Alcotest.(check (option int64))
     "unlisted is ignored" None (C.get Things.big cs);
   Alcotest.(check string)
