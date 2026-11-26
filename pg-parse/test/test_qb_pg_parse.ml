@@ -761,10 +761,24 @@ let codegen_options () =
   has "int by default" "id : int;" int;
   lacks "no int64 by default" "int64" int;
   let q_by_id = List.nth qs 1 in
-  let expr64 = Codegen.query_expr ~bigint:`Int64 st q_by_id in
+  let expr64 =
+    Codegen.query_expr ~bigint:`Int64 ~name:"main.ml:42" st q_by_id
+  in
+  has "query_expr ~name" {|Qb.Stmt.make ~name:"main.ml:42"|} expr64;
   has "query_expr ~bigint:`Int64 arg" "Qb.Stmt.arg Qb.int64 id" expr64;
   has "query_expr ~bigint:`Int64 row" "Qb.Stmt.ret Qb.int64" expr64;
   has "query_expr ~bigint:`Int64 type" "(int64 * string) Qb.stmt" expr64;
+  (* Composite primary keys get a labelled [by_pk]. *)
+  let comp_st =
+    ok_or_fail "composite"
+      (Schema.of_sql
+         "CREATE TABLE memberships (org_id BIGINT, user_id BIGINT, role TEXT \
+          NOT NULL, PRIMARY KEY (org_id, user_id));")
+  in
+  let comp_src = Codegen.ocaml comp_st in
+  has "composite by_pk signature" "fun ~org_id ~user_id ->" comp_src;
+  has "composite by_pk filter" "Qb.where (Qb.Ops.( = ) c__org_id org_id)"
+    comp_src;
   (* POSITION(sub IN :s) is not a list parameter; COALESCE/CASE in WHERE type
      their parameters during walk. *)
   let pos_q =

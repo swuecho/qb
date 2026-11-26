@@ -252,6 +252,11 @@ let run ?created_at db =
                  ~id:("00000000-0000-0000-0000-00000000000" ^ id)
                  ~account_id:ann.id ~title ~body:"..." ?rating ()))))
     [ ("1", "Apples", Some 4.5); ("2", "Bees", Some 2.0); ("3", "Cats", None) ];
+  Alcotest.(check bool)
+    "ppx auto-names statements with file:line" true
+    (match Qb.stmt_name (id_and_nickname "bo@example.com") with
+    | Some s -> String.starts_with ~prefix:"test_qb_ppx.ml:" s
+    | None -> false);
   Alcotest.(check (option (pair int (option string))))
     "a tuple"
     (Some (bo.id, Some "bo"))

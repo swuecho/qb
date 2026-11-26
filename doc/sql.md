@@ -23,9 +23,9 @@ out, and what it refuses. For a walkthrough, start with the
 
 | Query | Use |
 | --- | --- |
-| One table: insert, read, update, delete | The builder |
+| One table: insert, upsert, read, update, delete | The builder |
 | Two or more tables, aggregates, anything grouped | SQL: `[%sql]` |
-| A write with an expression, an upsert, or a second table | SQL: `[%sql]` |
+| A write with an expression or a second table | SQL: `[%sql]` |
 | A join whose conditions are decided at run time, or a database that isn't Postgres | The builder's `join` |
 | Anything more: a subquery, `WITH`, `UNION` | `Qb.Stmt.make`, or Caqti directly |
 
@@ -485,7 +485,8 @@ builder's `all` and `first`.
 
 Statements are prepared once per connection and reused, logged at debug
 level on the `Qb.src` source, and counted in the same 512-statement cache
-as builder queries.
+as builder queries. Statements written with `[%sql]` are automatically named
+`file.ml:line` so debug logs identify the exact call site.
 
 ## Queries in .sql files
 
@@ -503,7 +504,7 @@ SELECT count(*) FROM authors;
 ```
 
 ```sh
-qb-pg-parse queries migrations/*.sql -q queries.sql --tables Schema -o queries.ml
+qb-pg-parse queries migrations -q queries.sql --tables Schema -o queries.ml
 ```
 
 ```ocaml
@@ -520,17 +521,16 @@ As a dune rule:
  (targets queries.ml)
  (deps
   queries.sql
-  (glob_files migrations/*.sql))
+  (source_tree migrations))
  (action
-  (run qb-pg-parse queries %{dep:migrations/001_init.sql}
-   %{dep:migrations/002_reviews.sql} -q queries.sql --tables Schema -o
+  (run qb-pg-parse queries migrations -q queries.sql --tables Schema -o
    %{targets})))
 ```
 
 | | |
 | --- | --- |
-| `FILE...` | The schema files, replayed in the order given. |
-| `-q FILE` | A file of queries. Repeat for several. |
+| `PATH...` | Schema files, or directories whose `*.sql` files are replayed in order. |
+| `-q PATH` | A file (or directory) of queries. Repeat for several. |
 | `--tables MODULE` | As `-qb-tables`. |
 | `--bigint TYPE` | `int` (the default) or `int64` for `BIGINT` columns. |
 | `-o FILE` | Where to write; standard output by default. |

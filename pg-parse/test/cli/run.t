@@ -59,3 +59,28 @@ CLI behaviour for qb-pg-parse: init, check, gen, and queries.
   1
   $ grep -c 'Schema\.Users\.table' queries.ml
   1
+
+`init` propagates --bigint int64 to both dune stanzas.
+
+  $ qb-pg-parse init --bigint int64 | grep -c -- '--bigint int64'
+  1
+  $ qb-pg-parse init --bigint int64 | grep -c -- '-qb-bigint int64'
+  1
+
+`gen`, `check`, and `queries` accept a directory of *.sql files directly.
+
+  $ mkdir -p migs empty_dir
+  $ cp good.sql migs/001_users.sql
+  $ cat > migs/002_add_name.sql <<EOF
+  > ALTER TABLE users ADD COLUMN name TEXT;
+  > EOF
+  $ qb-pg-parse check migs
+  $ qb-pg-parse gen migs -o dir_schema.ml
+  $ grep -c 'name : string option;' dir_schema.ml
+  1
+  $ qb-pg-parse queries migs -q queries.sql --tables Dir_schema -o dir_queries.ml
+  $ grep -c 'Dir_schema\.Users\.table' dir_queries.ml
+  1
+  $ qb-pg-parse gen empty_dir
+  qb-pg-parse: no *.sql files found in empty_dir
+  [1]

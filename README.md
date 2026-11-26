@@ -131,7 +131,7 @@ text (an HTML checkbox's `on`, a `datetime-local`, ...); give `Qb.ty`
 the order given) and writes one qb module per table, like `Users` above:
 
 ```sh
-qb-pg-parse gen migrations/*.sql -o schema.ml
+qb-pg-parse gen migrations -o schema.ml  # or individual *.sql files
 qb-pg-parse check --caqti queries/*.sql   # syntax only; ? read as $1, $2, ...
 ```
 
@@ -154,8 +154,9 @@ Each module also gets the CRUD helpers:
   can fill in (identity, serial, `DEFAULT`, nullable) are optional, so leaving
   out a required one is a compile error:
   `Qb.Blocking.insert_values db (Users.values ~email:"ann@x.org" ())`.
-- `by_pk`: for a single-column primary key, the query for one row, to pass to
-  `first`, `update` or `delete`:
+- `by_pk`: for a single-column primary key (`Users.by_pk id`) or composite
+  primary key (`Memberships.by_pk ~org_id ~user_id`), the query for one row,
+  to pass to `first`, `update` or `delete`:
   `Qb.Blocking.update db Qb.Ops.[ Users.name := "Ann" ] (Users.by_pk id)`.
 
 Column types map to qb's exactly where they can (`BIGINT` to `Qb.int`, or

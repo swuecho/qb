@@ -13,49 +13,73 @@ let read file =
 let report file sql e =
   Printf.eprintf "%s: %s\n" file (Pg.error_to_string ~sql e)
 
-(* The schema the files build, replayed in order. *)
-let replay files =
-  let rec go st = function
-    | [] -> Ok st
-    | file :: rest -> (
-        let sql = read file in
-        match Schema.apply_sql ~init:st sql with
-        | Ok st -> go st rest
-        | Error e ->
-            report file sql e;
-            Error ())
-  in
-  go Schema.empty files
+(* Expand any directory into its *.sql files in sorted name order, matching
+   qb-ppx and qb-migrate. *)
+let expand_path path =
+  if Sys.is_directory path then
+    Sys.readdir path |> Array.to_list
+    |> List.filter (fun f -> Filename.check_suffix f ".sql")
+    |> List.sort compare
+    |> List.map (Filename.concat path)
+  else [ path ]
+
+let expand_paths paths = List.concat_map expand_path paths
+
+(* The schema the files (or directories) build, replayed in order. *)
+let replay paths =
+  match expand_paths paths with
+  | [] ->
+      Printf.eprintf "qb-pg-parse: no *.sql files found in %s\n"
+        (String.concat ", " paths);
+      Error ()
+  | files ->
+      let rec go st = function
+        | [] -> Ok st
+        | file :: rest -> (
+            let sql = read file in
+            match Schema.apply_sql ~init:st sql with
+            | Ok st -> go st rest
+            | Error e ->
+                report file sql e;
+                Error ())
+      in
+      go Schema.empty files
 
 let write output src =
   match output with
   | None -> print_string src
   | Some f -> Out_channel.with_open_bin f (fun oc -> output_string oc src)
 
-let queries files query_files tables bigint output =
+let queries files query_paths tables bigint output =
   match replay files with
   | Error () -> 1
   | Ok st -> (
-      let rec read_all acc = function
-        | [] -> Ok (List.rev acc)
-        | file :: rest -> (
-            let sql = In_channel.with_open_bin file In_channel.input_all in
-            match Query.of_sql st sql with
-            | Ok qs -> read_all (List.rev_append qs acc) rest
-            | Error e ->
-                report file sql e;
-                Error ())
-      in
-      match read_all [] query_files with
-      | Error () -> 1
-      | Ok qs -> (
-          match Codegen.queries ~bigint ?tables st qs with
-          | Ok src ->
-              write output src;
-              0
-          | Error m ->
-              Printf.eprintf "qb-pg-parse: %s\n" m;
-              1))
+      match expand_paths query_paths with
+      | [] ->
+          Printf.eprintf "qb-pg-parse: no *.sql files found in %s\n"
+            (String.concat ", " query_paths);
+          1
+      | query_files -> (
+          let rec read_all acc = function
+            | [] -> Ok (List.rev acc)
+            | file :: rest -> (
+                let sql = In_channel.with_open_bin file In_channel.input_all in
+                match Query.of_sql st sql with
+                | Ok qs -> read_all (List.rev_append qs acc) rest
+                | Error e ->
+                    report file sql e;
+                    Error ())
+          in
+          match read_all [] query_files with
+          | Error () -> 1
+          | Ok qs -> (
+              match Codegen.queries ~bigint ?tables st qs with
+              | Ok src ->
+                  write output src;
+                  0
+              | Error m ->
+                  Printf.eprintf "qb-pg-parse: %s\n" m;
+                  1)))
 
 let gen files only bigint output =
   match replay files with
@@ -77,19 +101,28 @@ let gen files only bigint output =
       write output (Codegen.ocaml ~bigint ~only st);
       0
 
-let check files caqti =
-  List.fold_left
-    (fun code file ->
-      let sql = read file in
-      match Pg.check ~caqti sql with
-      | Ok () -> code
-      | Error e ->
-          report file sql e;
-          1)
-    0 files
+let check paths caqti =
+  match expand_paths paths with
+  | [] ->
+      Printf.eprintf "qb-pg-parse: no *.sql files found in %s\n"
+        (String.concat ", " paths);
+      1
+  | files ->
+      List.fold_left
+        (fun code file ->
+          let sql = read file in
+          match Pg.check ~caqti sql with
+          | Ok () -> code
+          | Error e ->
+              report file sql e;
+              1)
+        0 files
 
 let files =
-  Arg.(non_empty & pos_all file [] & info [] ~docv:"FILE" ~doc:"SQL files.")
+  Arg.(
+    non_empty & pos_all file []
+    & info [] ~docv:"PATH"
+        ~doc:"SQL files, or directories whose *.sql files are read in order.")
 
 let output =
   Arg.(
@@ -110,10 +143,10 @@ let queries_cmd =
   let query_files =
     Arg.(
       non_empty & opt_all file []
-      & info [ "q"; "queries" ] ~docv:"FILE"
+      & info [ "q"; "queries" ] ~docv:"PATH"
           ~doc:
-            "A file of queries, each started by a line $(b,-- name: \
-             query_name). Repeat for several.")
+            "A file (or directory) of queries, each started by a line $(b,-- \
+             name: query_name). Repeat for several.")
   in
   let tables =
     Arg.(
@@ -141,8 +174,8 @@ let gen_cmd =
   Cmd.v
     (Cmd.info "gen"
        ~doc:
-         "Generate qb table modules from schema files, replayed in the order \
-          given (e.g. migrations).")
+         "Generate qb table modules from schema files or directories, replayed \
+          in order (e.g. migrations).")
     Term.(const gen $ files $ only $ bigint $ output)
 
 let check_cmd =
@@ -157,8 +190,14 @@ let check_cmd =
 
 (* The dune setup has three parts that must name the same folder and
    module; this writes them out together. *)
-let init dir modname =
+let init dir modname bigint =
   let file = String.uncapitalize_ascii modname ^ ".ml" in
+  let gen_bigint =
+    match bigint with `Int -> "" | `Int64 -> " --bigint int64"
+  in
+  let ppx_bigint =
+    match bigint with `Int -> "" | `Int64 -> " -qb-bigint int64"
+  in
   Printf.printf
     {|; For the dune file of the folder holding %s/.
 
@@ -168,7 +207,7 @@ let init dir modname =
  (deps
   (glob_files %s/*.sql))
  (action
-  (run qb-pg-parse gen %%{deps} -o %%{targets})))
+  (run qb-pg-parse gen %%{deps}%s -o %%{targets})))
 
 ; [%%sql "..."] checked against the same migrations: add the preprocess and
 ; preprocessor_deps fields to your own executable or library.
@@ -176,11 +215,11 @@ let init dir modname =
  (name main)
  (libraries qb caqti-driver-postgresql)
  (preprocess
-  (pps qb-ppx -- -qb-schema %s -qb-tables %s))
+  (pps qb-ppx -- -qb-schema %s -qb-tables %s%s))
  (preprocessor_deps
   (source_tree %s)))
 |}
-    dir file modname file dir dir modname dir;
+    dir file modname file dir gen_bigint dir modname ppx_bigint dir;
   0
 
 let init_cmd =
@@ -201,7 +240,7 @@ let init_cmd =
        ~doc:
          "Print the dune stanzas for a project: the rule that generates the \
           table modules, and the fields that turn on [%sql].")
-    Term.(const init $ dir $ modname)
+    Term.(const init $ dir $ modname $ bigint)
 
 let () =
   exit

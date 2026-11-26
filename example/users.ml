@@ -108,6 +108,54 @@ let demo () =
     (fun Row.[ id; name; age ] -> Printf.printf "  %d %s %d\n" id name age)
     rows;
 
+  print_endline "\n-- upsert (ON CONFLICT)";
+  let* skipped =
+    upsert db
+      (On_conflict.do_nothing ())
+      (values Users.table
+         Ops.[ Users.id := 1; Users.name := "Ann (duplicate)"; Users.age := 99 ])
+  in
+  Printf.printf "  do_nothing on existing id=1 -> %s\n"
+    (match skipped with None -> "skipped" | Some _ -> "inserted");
+  let* updated =
+    upsert db
+      On_conflict.(
+        do_update
+          ~target:[ col Users.id ]
+          ~excluded:[ col Users.name ]
+          ~set:Ops.[ Users.age := 35 ]
+          ())
+      (values Users.table
+         Ops.[ Users.id := 1; Users.name := "Ann Smith"; Users.age := 35 ])
+  in
+  Option.iter show updated;
+
+  print_endline "\n-- distinct + nulls_last";
+  let* emails =
+    from Users.table |> select [ Users.email ] |> distinct
+    |> order_by [ nulls_last (asc Users.email) ]
+    |> all db
+  in
+  List.iter
+    (fun Row.[ email ] ->
+      Printf.printf "  email: %s\n" (Option.value email ~default:"<none>"))
+    emails;
+
+  print_endline "\n-- changeset validation";
+  let cs =
+    Changeset.(
+      for_insert Users.table
+      |> cast
+           [ ("name", "A"); ("age", "200") ]
+           [ field Users.name; field Users.age ]
+      |> validate_required [ field Users.name; field Users.age ]
+      |> validate Users.name [ length ~min:2 () ]
+      |> validate Users.age [ range ~ge:0 ~lt:150 () ])
+  in
+  List.iter
+    (fun (e : Changeset.error) -> Printf.printf "  %s: %s\n" e.field e.message)
+    (Changeset.errors cs);
+
   print_endline "\n-- update";
   let* () =
     from Users.table

@@ -242,8 +242,8 @@ let table_module ~bigint ~module_name:m (t : table) =
   p "       in\n       { %s })\n"
     (String.concat "; " (List.map (fun (_, (f, _)) -> f) cols));
   values_fn b cols;
-  (match single_pk with
-  | Some k -> (
+  (match t.primary_key with
+  | [ k ] -> (
       match List.find_opt (fun ((c : column), _) -> c.name = k) cols with
       | Some (_, (_, v)) ->
           p
@@ -255,7 +255,30 @@ let table_module ~bigint ~module_name:m (t : table) =
             \    fun k -> Qb.where (Qb.Ops.( = ) c__ k) (Qb.from table)\n"
             v
       | None -> ())
-  | None -> ());
+  | _ :: _ :: _ as ks ->
+      let pk_cols =
+        List.filter_map
+          (fun k ->
+            List.find_opt (fun ((c : column), _) -> c.name = k) cols
+            |> Option.map snd)
+          ks
+      in
+      if List.length pk_cols = List.length ks then (
+        p
+          "\n\
+          \  (* The row with this composite primary key, as a query to pass to\n\
+          \     first, update or delete. *)\n\
+          \  let by_pk =\n\
+          \    let t__ = table";
+        List.iter (fun (_, v) -> p "\n    and c__%s = %s" v v) pk_cols;
+        p " in\n    fun";
+        List.iter (fun (f, _) -> p " ~%s" f) pk_cols;
+        p " ->\n      Qb.from t__";
+        List.iter
+          (fun (f, v) -> p "\n      |> Qb.where (Qb.Ops.( = ) c__%s %s)" v f)
+          pk_cols;
+        p "\n")
+  | [] -> ());
   p "end\n";
   Buffer.contents b
 
@@ -482,7 +505,7 @@ let query_fn ~bigint ?(shared = Hashtbl.create 0) ?tables (s : Schema.t)
     (if args = [] then "" else " " ^ String.concat ";\n      " args ^ " ")
     reader
 
-let query_expr ?(bigint = `Int) ?tables ?(rows = `Tuple) (s : Schema.t)
+let query_expr ?(bigint = `Int) ?tables ?(rows = `Tuple) ?name (s : Schema.t)
     (q : Query.t) =
   let col (c : Query.column) =
     ( ident c.name,
@@ -561,8 +584,11 @@ let query_expr ?(bigint = `Int) ?tables ?(rows = `Tuple) (s : Schema.t)
           (ident p.name))
       q.params
   in
-  Printf.sprintf "(Qb.Stmt.make %s [%s] (%s) : (%s) Qb.stmt)" (quoted q.sql)
-    (String.concat "; " args) reader row_type
+  let name_arg =
+    match name with None -> "" | Some n -> Printf.sprintf "~name:%S " n
+  in
+  Printf.sprintf "(Qb.Stmt.make %s%s [%s] (%s) : (%s) Qb.stmt)" name_arg
+    (quoted q.sql) (String.concat "; " args) reader row_type
 
 let queries ?(bigint = `Int) ?tables (s : Schema.t) qs =
   try

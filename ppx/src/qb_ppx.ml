@@ -185,8 +185,13 @@ let expand rows ~ctxt sql str_loc delim =
           in
           error ~loc "%s" e.message
       | Ok q -> (
+          let name =
+            Printf.sprintf "%s:%d"
+              (Filename.basename loc.loc_start.pos_fname)
+              loc.loc_start.pos_lnum
+          in
           match
-            Codegen.query_expr ~bigint:!bigint ?tables:!tables ~rows st q
+            Codegen.query_expr ~bigint:!bigint ?tables:!tables ~rows ~name st q
           with
           | exception Invalid_argument m -> error ~loc "qb: %s" m
           | src ->

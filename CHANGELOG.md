@@ -20,9 +20,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Caqti_lwt` connections.
 - **`qb-pg-parse`**: bindings to libpg_query (releasing the OCaml runtime lock
   while parsing) to check SQL, replay migrations into a schema, generate qb
-  table modules, and type SQL queries.
+  table modules (including `by_pk` for both single and composite primary keys),
+  and type SQL queries. `gen`, `queries`, and `check` accept directories as
+  well as individual `.sql` files, and `init` supports `--bigint int64`.
 - **`qb-ppx`**: `[%sql "..."]` and `[%sql.obj "..."]` queries checked and typed
-  against your migrations at compile time, including `-qb-bigint int|int64`.
+  against your migrations at compile time, including `-qb-bigint int|int64` and
+  automatic `file.ml:line` statement names in `Qb.src` debug logs.
 - **`qb-migrate`**: apply and verify `migrations/*.sql` against PostgreSQL
   (with SHA-256 checksums, `pg_dump` `search_path` and tuple-returning
   statement support, and atomic `baseline`), as a library or with the

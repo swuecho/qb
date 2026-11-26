@@ -201,6 +201,7 @@ module Codegen : sig
     ?bigint:[ `Int | `Int64 ] ->
     ?tables:string ->
     ?rows:[ `Tuple | `Object ] ->
+    ?name:string ->
     Schema.t ->
     Query.t ->
     string
@@ -209,7 +210,8 @@ module Codegen : sig
       [name]. Rows are tuples with an element per column, or the bare value when
       there is one; with [~tables], a [t.*] is one element, that table's row.
 
-      [~bigint] is as for {!ocaml}.
+      [~bigint] is as for {!ocaml}. [~name], when given, names the statement for
+      {!Qb.stmt_name} and [Qb.src] debug logs.
 
       With [~rows:`Object], a row of two columns or more is an object with a
       method per column, named after the column or its [AS]; a [t.*] read as a
