@@ -32,7 +32,7 @@ the second line of the SQL.
   > EOF
   $ build Unbound
   File "unbound.ml", line 4, characters 32-37:
-  4 |     WHERE age > 18 AND name = :name|}]
+  4 |       WHERE age > 18 AND name = :name|}]
                                       ^^^^^
   Error: Unbound value name
 
