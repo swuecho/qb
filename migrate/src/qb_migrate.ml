@@ -61,7 +61,7 @@ let of_dir dir =
            (Ok [])
       |> Result.map List.rev
 
-let checksum m = Digest.to_hex (Digest.string m.sql)
+let checksum m = Sha256.hex m.sql
 
 (* ---------- talking to the database ---------- *)
 
@@ -364,14 +364,14 @@ let run ?(out_of_order = false) ((module Db : DB) as db) ms =
 (* ---------- verify ---------- *)
 
 (* The schema the migrations describe, as [%sql] reads it. *)
-let schema ms =
+let schema ~default_schema ms =
   List.fold_left
     (fun st m ->
       let* st = st in
       let sql = Pg.strip_psql_meta m.sql in
       Result.map_error
         (fun e -> `Invalid (m.name, Pg.error_to_string ~sql e))
-        (Schema.apply_sql ~init:st sql))
+        (Schema.apply_sql ~default_schema ~init:st sql))
     (Ok Schema.empty) ms
 
 (* information_schema's name for a column type: the internal name, with a
@@ -548,8 +548,8 @@ let differences ~current (st : Schema.t) live keys =
       live_tables
 
 let verify (module Db : DB) ms =
-  let* st = schema ms in
   let* current = db_error (Db.find Q.current_schema ()) in
+  let* st = schema ~default_schema:current ms in
   let* live = db_error (Db.collect_list Q.columns ()) in
   let* keys = db_error (Db.collect_list Q.primary_keys ()) in
   let live =

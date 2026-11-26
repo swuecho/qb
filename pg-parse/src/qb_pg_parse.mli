@@ -94,9 +94,11 @@ module Schema : sig
       DROP IDENTITY, ADD PRIMARY KEY; RENAME of tables and columns; DROP TABLE.
       Anything else (indexes, data, functions) is skipped. *)
 
-  val apply_sql : ?init:t -> string -> (t, Pg.error) result
+  val apply_sql :
+    ?default_schema:string -> ?init:t -> string -> (t, Pg.error) result
   (** Replays more statements on top of [init], e.g. one migration file at a
-      time. *)
+      time. [default_schema] (default ["public"]) is the schema unqualified
+      table names are matched against. *)
 
   val find : ?schema:string -> t -> string -> table option
 

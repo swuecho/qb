@@ -38,7 +38,13 @@ let () =
                 match brew_prefix c with
                 | Some p -> flags_for p
                 | None ->
-                    List.find_opt has_header [ "/usr/local"; "/opt/local" ]
+                    List.find_opt has_header
+                      [
+                        "/opt/homebrew/opt/libpg_query";
+                        "/opt/homebrew";
+                        "/usr/local";
+                        "/opt/local";
+                      ]
                     |> Option.fold ~none:([], [ "-lpg_query" ]) ~some:flags_for)
             )
       in

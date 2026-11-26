@@ -10,20 +10,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`qb`**: a typed, Drizzle-style query builder for single-table CRUD on
   Caqti. Select, insert, update, delete and `CREATE TABLE`, with compile-time
-  checks on columns, row types and conditions. Includes changesets, statement
-  caching, logging, transactions, prepared statements, `RETURNING`, batch
-  inserts and a two-table join.
+  checks on columns, row types and conditions. Includes changesets, thread- and
+  domain-safe statement caching, logging (including named statements),
+  transactions, prepared statements, `RETURNING`, `distinct`,
+  `nulls_first` / `nulls_last` ordering, `insert_many`, `insert_many_values`,
+  and a two-table join.
 - **`qb-lwt`**: the same queries, changesets and transactions on
   `Caqti_lwt` connections.
-- **`qb-pg-parse`**: bindings to libpg_query to check SQL, replay migrations
-  into a schema, generate qb table modules, and type SQL queries.
-- **`qb-ppx`**: `[%sql "..."]` queries checked and typed against your
-  migrations at compile time.
-- **`qb-migrate`**: apply and verify `migrations/*.sql` against PostgreSQL,
-  as a library or with the `qb-migrate` command.
+- **`qb-pg-parse`**: bindings to libpg_query (releasing the OCaml runtime lock
+  while parsing) to check SQL, replay migrations into a schema, generate qb
+  table modules, and type SQL queries.
+- **`qb-ppx`**: `[%sql "..."]` and `[%sql.obj "..."]` queries checked and typed
+  against your migrations at compile time, including `-qb-bigint int|int64`.
+- **`qb-migrate`**: apply and verify `migrations/*.sql` against PostgreSQL
+  (with SHA-256 checksums, `pg_dump` `search_path` and tuple-returning
+  statement support, and atomic `baseline`), as a library or with the
+  `qb-migrate` command.
 - A tutorial, an SQL reference and a migrations reference under `doc/`, plus
   runnable examples under `example/`.
-- CI on OCaml 4.14 and 5.4, formatting checks, and odoc builds.
+- CI on OCaml 4.14 and 5.4 (with cached `libpg_query` builds), formatting
+  checks, CLI cram tests, and odoc builds.
 
 ### Notes
 

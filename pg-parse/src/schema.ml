@@ -142,10 +142,10 @@ let relation j =
 
 (* ---------- applying statements ---------- *)
 
-let same_table (schema, name) (t : table) =
+let same_table ~default_schema (schema, name) (t : table) =
   t.name = name
-  && Option.value schema ~default:"public"
-     = Option.value t.schema ~default:"public"
+  && Option.value schema ~default:default_schema
+     = Option.value t.schema ~default:default_schema
 
 let qualified (schema, name) =
   match schema with Some s -> s ^ "." ^ name | None -> name
@@ -164,16 +164,19 @@ let set_pk keys (t : table) =
   in
   { t with columns; primary_key = keys }
 
-let create st body =
+let create ~default_schema st body =
   let rel = relation body in
-  let exists = List.exists (same_table rel) st.tables in
+  let exists = List.exists (same_table ~default_schema rel) st.tables in
   if exists && bool "if_not_exists" body then st
   else
     let st =
       if not exists then st
       else
         {
-          tables = List.filter (fun t -> not (same_table rel t)) st.tables;
+          tables =
+            List.filter
+              (fun t -> not (same_table ~default_schema rel t))
+              st.tables;
           warnings =
             st.warnings
             @ [ "CREATE TABLE " ^ qualified rel ^ ": already exists, replaced" ];
@@ -207,15 +210,17 @@ let create st body =
     let t = if pk = [] then t else set_pk pk t in
     { tables = st.tables @ [ t ]; warnings = st.warnings @ !warnings }
 
-let update_table st rel f =
-  match List.find_opt (same_table rel) st.tables with
+let update_table ~default_schema st rel f =
+  match List.find_opt (same_table ~default_schema rel) st.tables with
   | None ->
       { st with warnings = st.warnings @ [ "unknown table " ^ qualified rel ] }
   | Some _ ->
       let warnings = ref [] in
       let warn m = warnings := !warnings @ [ qualified rel ^ ": " ^ m ] in
       let tables =
-        List.map (fun t -> if same_table rel t then f warn t else t) st.tables
+        List.map
+          (fun t -> if same_table ~default_schema rel t then f warn t else t)
+          st.tables
       in
       { tables; warnings = st.warnings @ !warnings }
 
@@ -316,9 +321,9 @@ let alter_cmd warn (t : table) cmd =
       t
   | None -> t
 
-let apply st stmt =
+let apply ~default_schema st stmt =
   match node stmt with
-  | Some ("CreateStmt", body) -> create st body
+  | Some ("CreateStmt", body) -> create ~default_schema st body
   | Some ("AlterTableStmt", body) when str "objtype" body = Some "OBJECT_TABLE"
     ->
       let cmds =
@@ -327,17 +332,18 @@ let apply st stmt =
             match node c with Some ("AlterTableCmd", c) -> Some c | _ -> None)
           (list "cmds" body)
       in
-      update_table st (relation body) (fun warn t ->
+      update_table ~default_schema st (relation body) (fun warn t ->
           List.fold_left (alter_cmd warn) t cmds)
   | Some ("RenameStmt", body) -> (
       let rel = relation body in
       let newname = Option.value (str "newname" body) ~default:"" in
       match str "renameType" body with
       | Some "OBJECT_TABLE" ->
-          update_table st rel (fun _ t -> { t with name = newname })
+          update_table ~default_schema st rel (fun _ t ->
+              { t with name = newname })
       | Some "OBJECT_COLUMN" ->
           let old = Option.value (str "subname" body) ~default:"" in
-          update_table st rel (fun warn t ->
+          update_table ~default_schema st rel (fun warn t ->
               let t =
                 map_column old
                   (fun (c : column) -> { c with name = newname })
@@ -368,10 +374,13 @@ let apply st stmt =
             | [ n ] -> (None, n)
             | _ -> (None, "")
           in
-          if List.exists (same_table rel) st.tables then
+          if List.exists (same_table ~default_schema rel) st.tables then
             {
               st with
-              tables = List.filter (fun t -> not (same_table rel t)) st.tables;
+              tables =
+                List.filter
+                  (fun t -> not (same_table ~default_schema rel t))
+                  st.tables;
             }
           else if bool "missing_ok" body then st
           else
@@ -383,8 +392,10 @@ let apply st stmt =
         st (list "objects" body)
   | _ -> st
 
-let apply_sql ?(init = empty) sql =
-  Result.map (List.fold_left apply init) (Pg.statements sql)
+let apply_sql ?(default_schema = "public") ?(init = empty) sql =
+  Result.map (List.fold_left (apply ~default_schema) init) (Pg.statements sql)
 
 let of_sql sql = apply_sql sql
-let find ?schema t name = List.find_opt (same_table (schema, name)) t.tables
+
+let find ?schema t name =
+  List.find_opt (same_table ~default_schema:"public" (schema, name)) t.tables
