@@ -1288,6 +1288,41 @@ let test_changeset_db db =
     (fun () ->
       ignore (Blocking.insert_changeset db (C.for_update Signups.table a)))
 
+(* Concurrent threads sharing the statement cache and transaction guard. *)
+let test_concurrent_threads () =
+  let worker i =
+    let db = ok (Caqti_blocking.connect (Uri.of_string "sqlite3::memory:")) in
+    let (module Db : DB) = db in
+    Fun.protect ~finally:Db.disconnect @@ fun () ->
+    ok (Blocking.create_table db Users.table);
+    for j = 1 to 25 do
+      ok
+        (Blocking.transaction db (fun () ->
+             let _ =
+               ok
+                 (Blocking.insert_values db
+                    (values Users.table
+                       Ops.
+                         [
+                           Users.name := Printf.sprintf "u%d_%d" i j;
+                           Users.age := j;
+                         ]))
+             in
+             let _ =
+               ok
+                 (from Users.table
+                 |> where Ops.(Users.age >= 1)
+                 |> Blocking.all db)
+             in
+             Ok ()))
+    done;
+    Alcotest.(check int)
+      "all rows inserted" 25
+      (ok (from Users.table |> Blocking.count db))
+  in
+  let threads = List.init 4 (fun i -> Thread.create worker i) in
+  List.iter Thread.join threads
+
 let db_tests url =
   List.map
     (fun (name, f) -> Alcotest.test_case name `Quick (with_db url f))
@@ -1325,6 +1360,11 @@ let () =
         [
           Alcotest.test_case "cast" `Quick test_cast;
           Alcotest.test_case "validate" `Quick test_validate;
+        ] );
+      ( "concurrency",
+        [
+          Alcotest.test_case "shared cache and transactions" `Quick
+            test_concurrent_threads;
         ] );
       ("sqlite", db_tests "sqlite3::memory:");
       ( "postgres",

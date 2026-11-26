@@ -394,6 +394,7 @@ struct
      second BEGIN is ignored by the database and the inner COMMIT then ends
      the outer transaction early, so that is refused here. It takes
      [G.finally] to know when a transaction is over, however it ends. *)
+  let in_transaction_mutex = Mutex.create ()
   let in_transaction : Obj.t list ref = ref []
 
   let transaction ((module Db : B.CONNECTION) as db) f =
@@ -401,15 +402,18 @@ struct
     | None -> Db.with_transaction f
     | Some { finally } ->
         let key = Obj.repr db in
-        if List.memq key !in_transaction then
-          invalid_arg
-            "Qb.transaction: this connection is already in a transaction, and \
-             transactions don't nest";
-        in_transaction := key :: !in_transaction;
+        Cache.with_lock in_transaction_mutex (fun () ->
+            if List.memq key !in_transaction then
+              invalid_arg
+                "Qb.transaction: this connection is already in a transaction, \
+                 and transactions don't nest";
+            in_transaction := key :: !in_transaction);
         finally
           (fun () -> Db.with_transaction f)
           (fun () ->
-            in_transaction := List.filter (fun k -> k != key) !in_transaction)
+            Cache.with_lock in_transaction_mutex (fun () ->
+                in_transaction :=
+                  List.filter (fun k -> k != key) !in_transaction))
 
   let create_table db t =
     let o = out_for db in

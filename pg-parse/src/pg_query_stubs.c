@@ -1,10 +1,13 @@
 /* The one libpg_query call qb-pg-parse needs: parse SQL to a JSON tree. */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <caml/alloc.h>
+#include <caml/fail.h>
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
+#include <caml/threads.h>
 
 #include <pg_query.h>
 
@@ -15,9 +18,11 @@ CAMLprim value qb_pg_query_parse(value v_sql)
   CAMLparam1(v_sql);
   CAMLlocal3(v_res, v_payload, v_str);
 
+  size_t len = caml_string_length(v_sql);
+
   /* libpg_query reads up to the first NUL, so a string holding one would be
      parsed only in part. */
-  if (strlen(String_val(v_sql)) != caml_string_length(v_sql)) {
+  if (strlen(String_val(v_sql)) != len) {
     v_str = caml_copy_string("SQL text contains a NUL byte");
     v_payload = caml_alloc_tuple(2);
     Store_field(v_payload, 0, v_str);
@@ -27,7 +32,17 @@ CAMLprim value qb_pg_query_parse(value v_sql)
     CAMLreturn(v_res);
   }
 
-  PgQueryParseResult r = pg_query_parse(String_val(v_sql));
+  /* Copy before releasing the OCaml runtime lock so the GC may move v_sql. */
+  char *sql_copy = malloc(len + 1);
+  if (sql_copy == NULL) {
+    caml_raise_out_of_memory();
+  }
+  memcpy(sql_copy, String_val(v_sql), len + 1);
+
+  caml_release_runtime_system();
+  PgQueryParseResult r = pg_query_parse(sql_copy);
+  caml_acquire_runtime_system();
+  free(sql_copy);
 
   if (r.error != NULL) {
     v_str = caml_copy_string(r.error->message ? r.error->message : "");

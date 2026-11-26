@@ -81,17 +81,26 @@ let caqti_query sql =
 (* Requests are cached by SQL text so the driver can keep them prepared.
    An entry is reused only if Caqti confirms its parameter and row types are
    the same as the new ones, so a hit is type-safe. The cache is bounded; past
-   the limit, new statements run unprepared. It is not safe to share across
-   domains. *)
+   the limit, new statements run unprepared. Guarded by a mutex so it is safe
+   to share across threads and OCaml 5 domains. *)
 type 'm entry =
   | Entry :
       'p Caqti_type.t * 'x Caqti_type.t * ('p, 'x, 'm) Caqti_request.t
       -> 'm entry
 
-type 'm t = { mult : 'm Caqti_mult.t; table : (string, 'm entry) Hashtbl.t }
+type 'm t = {
+  mult : 'm Caqti_mult.t;
+  mutex : Mutex.t;
+  table : (string, 'm entry) Hashtbl.t;
+}
+
+(* Compatible with OCaml 4.14 (Mutex.protect was added in 5.1). *)
+let with_lock m f =
+  Mutex.lock m;
+  Fun.protect ~finally:(fun () -> Mutex.unlock m) f
 
 let limit = 512
-let make mult = { mult; table = Hashtbl.create 64 }
+let make mult = { mult; mutex = Mutex.create (); table = Hashtbl.create 64 }
 let zero : Caqti_mult.zero t = make Caqti_mult.zero
 let one : Caqti_mult.one t = make Caqti_mult.one
 let zero_or_one : Caqti_mult.zero_or_one t = make Caqti_mult.zero_or_one
@@ -101,23 +110,33 @@ let zero_or_more : Caqti_mult.zero_or_more t = make Caqti_mult.zero_or_more
    is. *)
 let request (type p x) ?(oneshot = false) (c : 'm t) (pt : p Caqti_type.t)
     (rt : x Caqti_type.t) sql : (p, x, 'm) Caqti_request.t =
-  (* Read only for a statement that isn't in the cache yet. *)
-  let query = lazy (caqti_query sql) in
-  let create ~oneshot =
-    Caqti_request.create ~oneshot pt rt c.mult (fun _ -> Lazy.force query)
+  let create ~oneshot q =
+    Caqti_request.create ~oneshot pt rt c.mult (fun _ -> q)
   in
-  let fresh () =
-    if oneshot || Hashtbl.length c.table >= limit then create ~oneshot:true
-    else
-      let r = create ~oneshot:false in
-      Hashtbl.replace c.table sql (Entry (pt, rt, r));
-      r
+  let lookup () : [ `Hit of (p, x, 'm) Caqti_request.t | `Oneshot | `Miss ] =
+    match Hashtbl.find_opt c.table sql with
+    | Some (Entry (pt', rt', r)) -> (
+        match (Caqti_type.unify pt' pt, Caqti_type.unify rt' rt) with
+        | Some Caqti_type.Equal, Some Caqti_type.Equal -> `Hit r
+        (* Same SQL with different types: don't replace the cached entry, which
+           would allocate a new prepared statement on every alternating call. *)
+        | _ -> `Oneshot)
+    | None -> if Hashtbl.length c.table >= limit then `Oneshot else `Miss
   in
-  match Hashtbl.find_opt c.table sql with
-  | Some (Entry (pt', rt', r)) -> (
-      match (Caqti_type.unify pt' pt, Caqti_type.unify rt' rt) with
-      | Some Caqti_type.Equal, Some Caqti_type.Equal -> r
-      (* Same SQL with different types: don't replace the cached entry, which
-         would allocate a new prepared statement on every alternating call. *)
-      | _ -> create ~oneshot:true)
-  | None -> fresh ()
+  if oneshot then create ~oneshot:true (caqti_query sql)
+  else
+    match with_lock c.mutex lookup with
+    | `Hit r -> r
+    | `Oneshot -> create ~oneshot:true (caqti_query sql)
+    | `Miss ->
+        (* Parse outside the mutex; the resulting Caqti_query.t is immutable,
+           avoiding both lock contention and concurrent Lazy.force races. *)
+        let q = caqti_query sql in
+        with_lock c.mutex (fun () ->
+            match lookup () with
+            | `Hit r -> r
+            | `Oneshot -> create ~oneshot:true q
+            | `Miss ->
+                let r = create ~oneshot:false q in
+                Hashtbl.replace c.table sql (Entry (pt, rt, r));
+                r)

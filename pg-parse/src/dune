@@ -1,7 +1,7 @@
 (library
  (name qb_pg_parse)
  (public_name qb-pg-parse)
- (libraries angstrom yojson)
+ (libraries angstrom threads yojson)
  (foreign_stubs
   (language c)
   (names pg_query_stubs)

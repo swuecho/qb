@@ -797,8 +797,8 @@ val src : Logs.src
     request by its SQL text, reusing it only when its parameter and row types
     match. The cache holds up to 512 statements; past that, new statements run
     unprepared. A statement whose text depends on the length of a list ([is_in],
-    [insert_many], a list argument) is never kept: there is no end of those.
-    Don't run queries from several domains at once. *)
+    [insert_many], a list argument) is never kept: there is no end of those. The
+    cache is safe to share across threads and domains. *)
 
 (** The queries, for one kind of Caqti connection. *)
 module type S = sig

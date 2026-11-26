@@ -9,4 +9,5 @@
   mtime
   mtime.clock.os
   ptime
+  threads
   uri))

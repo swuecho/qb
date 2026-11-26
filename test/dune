@@ -11,6 +11,7 @@
   caqti-driver-sqlite3
   caqti-driver-postgresql
   ptime
+  threads
   uri))
 
 ; The tokenizer on its own. It is private to qb and to qb-pg-parse, so the
