@@ -823,7 +823,33 @@ let codegen_options () =
           :fallback END IS NOT NULL")
   in
   Alcotest.(check string)
-    "CASE in WHERE types param" "varchar" (List.hd case_q.params).ty.name
+    "CASE in WHERE types param" "varchar" (List.hd case_q.params).ty.name;
+  let param_types sql =
+    let q = ok_or_fail sql (Query.one st sql) in
+    List.map (fun (p : Query.param) -> p.name ^ ":" ^ p.ty.name) q.params
+  in
+  Alcotest.(check (list string))
+    "simple CASE, searched CASE, NULLIF, GREATEST, bool, unary -"
+    [
+      "e:text";
+      "flag:bool";
+      "empty:text";
+      "floor:int4";
+      "skip:bool";
+      "ok:bool";
+      "n:int4";
+    ]
+    (param_types
+       "SELECT CASE email WHEN :e THEN 1 ELSE 0 END, CASE WHEN :flag THEN \
+        email ELSE '' END, NULLIF(email, :empty), GREATEST(login_count, \
+        :floor) FROM accounts WHERE NOT :skip AND (:ok IS TRUE OR login_count \
+        = - :n)");
+  Alcotest.(check (list string))
+    "UPDATE with CASE and GREATEST params"
+    [ "a:int4"; "b:int4"; "id:int8" ]
+    (param_types
+       "UPDATE accounts SET login_count = CASE WHEN active THEN :a ELSE :b END \
+        WHERE id = :id")
 
 (* Two accounts and three articles, for the generated queries. *)
 let seed_queries ~insert_account ~insert_article =
@@ -1084,6 +1110,15 @@ let oracle_queries =
     "SELECT user_id FROM posts GROUP BY user_id HAVING count(*) > :min";
     "SELECT COALESCE(name, :fallback) FROM users";
     "SELECT CASE WHEN active THEN email ELSE :fallback END FROM users";
+    "SELECT CASE WHEN :flag THEN email ELSE name END FROM users";
+    "SELECT CASE email WHEN :e THEN 1 ELSE 0 END FROM users";
+    "SELECT NULLIF(email, :empty) FROM users";
+    "SELECT GREATEST(age, :floor), LEAST(small, :cap) FROM users";
+    "SELECT id FROM users WHERE NOT :skip AND (:only_active IS TRUE OR age > 0)";
+    "SELECT id FROM users WHERE :flag";
+    "SELECT id FROM users WHERE age = - :n";
+    "UPDATE users SET age = CASE WHEN active THEN :a ELSE :b END WHERE id = :id";
+    "UPDATE users SET age = GREATEST(:a, :b) WHERE id = :id";
     "SELECT id FROM posts WHERE published_at < now() - :age::interval";
     (* aggregates *)
     "SELECT count(*), count(name), count(DISTINCT age) FROM users";

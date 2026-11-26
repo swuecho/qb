@@ -289,11 +289,32 @@ let rec type_of env j : (pg_type * bool) option =
         (Option.bind (field "lexpr" a) (type_of env))
   (* GREATEST / LEAST skip NULLs. *)
   | Some ("MinMaxExpr", m) -> (
-      let typed = List.filter_map (type_of env) (list "args" m) in
+      let args = list "args" m in
+      let typed =
+        List.filter_map
+          (fun a -> if is_null_const a then None else type_of env a)
+          args
+      in
       match common (List.map fst typed) with
-      | Some ty when List.length typed = List.length (list "args" m) ->
-          Some (ty, List.for_all snd typed)
-      | _ -> None)
+      | None -> None
+      | Some ty ->
+          List.iter
+            (fun a ->
+              match node a with
+              | Some ("ParamRef", pr) -> set_param env pr ty
+              | _ -> ())
+            args;
+          if
+            List.for_all
+              (fun a -> is_null_const a || type_of env a <> None)
+              args
+          then
+            Some
+              ( ty,
+                List.for_all
+                  (fun a -> is_null_const a || can_be_null env a)
+                  args )
+          else None)
   (* CASE: the type its branches share; NULL with no ELSE, or when a branch
      is. *)
   | Some ("CaseExpr", c) -> (
@@ -416,14 +437,28 @@ let rec expect env j (ty : pg_type) =
   in
   match node j with
   | Some ("ParamRef", pr) -> set_param env pr ty
+  | Some ("A_Expr", a)
+    when field "lexpr" a = None
+         && str "kind" a = Some "AEXPR_OP"
+         && List.mem (names (list "name" a)) [ [ "-" ]; [ "+" ] ] ->
+      Option.iter (fun x -> expect env x ty) (field "rexpr" a)
   | Some ("A_Expr", a) when ty.array_dims = 0 -> (
       match (arithmetic a, family ty) with
       | Some "||", "text" -> sides a
       | Some "||", _ -> ()
       | Some _, ("integer" | "float") -> sides a
       | _ -> ())
-  | Some ("CoalesceExpr", c) ->
+  | Some ("CoalesceExpr", c) | Some ("MinMaxExpr", c) ->
       List.iter (fun a -> expect env a ty) (list "args" c)
+  | Some ("CaseExpr", c) ->
+      List.iter
+        (fun w ->
+          match node w with
+          | Some ("CaseWhen", w) ->
+              Option.iter (fun r -> expect env r ty) (field "result" w)
+          | _ -> ())
+        (list "args" c);
+      Option.iter (fun r -> expect env r ty) (field "defresult" c)
   | Some ("FuncCall", f)
     when family ty = "text"
          && List.mem (func_name f)
@@ -456,6 +491,20 @@ let rec walk ?(aliases = []) env (j : J.t) =
   match j with
   | `Assoc [ (("SubLink" | "SelectStmt"), body) ] ->
       fail ?at:(loc body) "subqueries aren't supported"
+  | `Assoc [ ("BoolExpr", (`Assoc kv as b)) ] ->
+      List.iter
+        (fun a ->
+          match node a with
+          | Some ("ParamRef", pr) -> set_param env pr (simple "bool")
+          | _ -> ())
+        (list "args" b);
+      List.iter (fun (_, v) -> walk ~aliases env v) kv
+  | `Assoc [ ("BooleanTest", bt) ] ->
+      let arg = Option.value (field "arg" bt) ~default:`Null in
+      (match node arg with
+      | Some ("ParamRef", pr) -> set_param env pr (simple "bool")
+      | _ -> ());
+      walk ~aliases env arg
   | `Assoc [ ("NullTest", nt) ] ->
       let arg = Option.value (field "arg" nt) ~default:`Null in
       (match node arg with
@@ -507,6 +556,7 @@ let rec walk ?(aliases = []) env (j : J.t) =
            match node r with Some ("List", l) -> list "items" l | _ -> [ r ]
          in
          List.iter (unify env l) rs
+       else if str "kind" a = Some "AEXPR_NULLIF" then unify env l r
        else if
          (* [:p - 100] says little about :p: a constant fits many types.
             ['%' || :p] says it is text. *)
@@ -533,7 +583,30 @@ let rec walk ?(aliases = []) env (j : J.t) =
       | `Assoc [ (_, body) ] ->
           walk ~aliases env (Option.value (field "arg" body) ~default:`Null)
       | _ -> ())
-  | `Assoc [ (("CoalesceExpr" | "CaseExpr"), `Assoc kv) ] as expr ->
+  | `Assoc [ ("CaseExpr", (`Assoc kv as c)) ] as expr ->
+      List.iter (fun (_, v) -> walk ~aliases env v) kv;
+      if aliases = [] then (
+        (match field "arg" c with
+        | Some arg ->
+            List.iter
+              (fun w ->
+                match node w with
+                | Some ("CaseWhen", w) ->
+                    Option.iter (unify env arg) (field "expr" w)
+                | _ -> ())
+              (list "args" c)
+        | None ->
+            List.iter
+              (fun w ->
+                match node w with
+                | Some ("CaseWhen", w) -> (
+                    match Option.bind (field "expr" w) node with
+                    | Some ("ParamRef", pr) -> set_param env pr (simple "bool")
+                    | _ -> ())
+                | _ -> ())
+              (list "args" c));
+        ignore (type_of env expr))
+  | `Assoc [ (("CoalesceExpr" | "MinMaxExpr"), `Assoc kv) ] as expr ->
       List.iter (fun (_, v) -> walk ~aliases env v) kv;
       if aliases = [] then ignore (type_of env expr)
   | `Assoc kv -> List.iter (fun (_, v) -> walk ~aliases env v) kv

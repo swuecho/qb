@@ -21,8 +21,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`qb-pg-parse`**: bindings to libpg_query (releasing the OCaml runtime lock
   while parsing) to check SQL, replay migrations into a schema, generate qb
   table modules (including `by_pk` for both single and composite primary keys),
-  and type SQL queries. `gen`, `queries`, and `check` accept directories as
-  well as individual `.sql` files, and `init` supports `--bigint int64`.
+  and type SQL queries (including simple/searched `CASE`, `NULLIF`,
+  `GREATEST`/`LEAST`, boolean expressions, and unary-negated parameter
+  inference). `gen`, `queries`, and `check` accept directories as well as
+  individual `.sql` files, and `init` supports `--bigint int64`.
 - **`qb-ppx`**: `[%sql "..."]` and `[%sql.obj "..."]` queries checked and typed
   against your migrations at compile time, including `-qb-bigint int|int64`,
   full-token error spans (with exact single-line and delimited-string offsets),

@@ -150,6 +150,12 @@ let unsupported s k what =
   | Some v -> fail ?at:(loc v) "%s isn't supported" what
   | None -> ()
 
+let walk_bool env j =
+  (match node j with
+  | Some ("ParamRef", pr) -> set_param env pr (simple "bool")
+  | _ -> ());
+  walk env j
+
 let select schema names s =
   unsupported s "withClause" "WITH";
   unsupported s "valuesLists" "VALUES";
@@ -158,8 +164,8 @@ let select schema names s =
   let froms = List.map (sources schema) (list "fromClause" s) in
   let env = new_env (List.concat_map fst froms) names in
   let part k = Option.value (field k s) ~default:`Null in
-  List.iter (walk env) (List.concat_map snd froms);
-  walk env (part "whereClause");
+  List.iter (walk_bool env) (List.concat_map snd froms);
+  walk_bool env (part "whereClause");
   walk env (part "distinctClause");
   walk env (part "targetList");
   let aliases =
@@ -169,7 +175,7 @@ let select schema names s =
       (list "targetList" s)
   in
   walk ~aliases env (part "groupClause");
-  walk env (part "havingClause");
+  walk_bool env (part "havingClause");
   walk ~aliases env (part "sortClause");
   List.iter
     (fun k ->
@@ -326,7 +332,7 @@ let insert schema names s =
                   | None -> Option.iter (walk env) (field "expr" ie))
               | _ -> ())
             (list "indexElems" inf);
-          walk env (Option.value (field "whereClause" inf) ~default:`Null)
+          walk_bool env (Option.value (field "whereClause" inf) ~default:`Null)
       | None -> ());
       let env =
         {
@@ -335,7 +341,7 @@ let insert schema names s =
         }
       in
       set_list env src (list "targetList" oc);
-      walk env (Option.value (field "whereClause" oc) ~default:`Null));
+      walk_bool env (Option.value (field "whereClause" oc) ~default:`Null));
   finish env (returning env s)
 
 let update schema names s =
@@ -343,9 +349,9 @@ let update schema names s =
   let src = target schema s in
   let froms = List.map (sources schema) (list "fromClause" s) in
   let env = new_env (src :: List.concat_map fst froms) names in
-  List.iter (walk env) (List.concat_map snd froms);
+  List.iter (walk_bool env) (List.concat_map snd froms);
   set_list env src (list "targetList" s);
-  walk env (Option.value (field "whereClause" s) ~default:`Null);
+  walk_bool env (Option.value (field "whereClause" s) ~default:`Null);
   finish env (returning env s)
 
 let delete schema names s =
@@ -353,8 +359,8 @@ let delete schema names s =
   let src = target schema s in
   let froms = List.map (sources schema) (list "usingClause" s) in
   let env = new_env (src :: List.concat_map fst froms) names in
-  List.iter (walk env) (List.concat_map snd froms);
-  walk env (Option.value (field "whereClause" s) ~default:`Null);
+  List.iter (walk_bool env) (List.concat_map snd froms);
+  walk_bool env (Option.value (field "whereClause" s) ~default:`Null);
   finish env (returning env s)
 
 (* ---------- entry points ---------- *)
