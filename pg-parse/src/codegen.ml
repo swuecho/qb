@@ -363,12 +363,7 @@ let rec both = function
 let quoted sql =
   let rec pick k =
     let id = if k = 0 then "sql" else Printf.sprintf "sql%d" k in
-    let close = "|" ^ id ^ "}" in
-    let n = String.length close in
-    let rec has i =
-      i + n <= String.length sql && (String.sub sql i n = close || has (i + 1))
-    in
-    if has 0 then pick (k + 1) else id
+    if Util.contains_sub ~sub:("|" ^ id ^ "}") sql then pick (k + 1) else id
   in
   let id = pick 0 in
   Printf.sprintf "{%s|%s|%s}" id sql id
@@ -432,18 +427,14 @@ let query_fn ?(shared = Hashtbl.create 0) ?tables (s : Schema.t) (q : Query.t) =
             q.row
         in
         let fields = List.map (fun (c : Query.column) -> ident c.name) cols in
-        let rec dup = function
-          | [] -> ()
-          | f :: rest ->
-              if List.mem f rest then
-                raise
-                  (Bad_query
-                     (Printf.sprintf
-                        "query %s: two columns are named %s: rename one with AS"
-                        q.name f));
-              dup rest
-        in
-        dup fields;
+        (match Util.first_dup fields with
+        | Some f ->
+            raise
+              (Bad_query
+                 (Printf.sprintf
+                    "query %s: two columns are named %s: rename one with AS"
+                    q.name f))
+        | None -> ());
         let ret (c : Query.column) =
           Printf.sprintf "Qb.Stmt.ret %s" (qb_ty c.ty c.nullable)
         in
@@ -487,7 +478,11 @@ let query_fn ?(shared = Hashtbl.create 0) ?tables (s : Schema.t) (q : Query.t) =
       labels q.params
   in
   Printf.sprintf
-    "%slet %s%s : %s Qb.stmt =\n  Qb.Stmt.make ~name:%S\n    %s\n    [%s]\n    (%s)\n"
+    "%slet %s%s : %s Qb.stmt =\n\
+    \  Qb.Stmt.make ~name:%S\n\
+    \    %s\n\
+    \    [%s]\n\
+    \    (%s)\n"
     decl fn
     (String.concat "" (List.map (fun l -> " ~" ^ l) labels))
     row_type q.name (quoted q.sql)
@@ -544,16 +539,11 @@ let query_expr ?tables ?(rows = `Tuple) (s : Schema.t) (q : Query.t) =
     (* An object with a method per column; one column is still the bare
        value. *)
     | `Object, _ :: _ :: _ ->
-        let rec dup = function
-          | [] -> ()
-          | n :: rest ->
-              if List.mem n rest then
-                invalid_arg
-                  (Printf.sprintf "two columns are named %s: rename one with AS"
-                     n);
-              dup rest
-        in
-        dup names;
+        (match Util.first_dup names with
+        | Some n ->
+            invalid_arg
+              (Printf.sprintf "two columns are named %s: rename one with AS" n)
+        | None -> ());
         ( Printf.sprintf "Qb.Stmt.map (fun %s -> object %s end) (%s)" (nest vars)
             (String.concat " "
                (List.map2 (Printf.sprintf "method %s = %s") names vars))

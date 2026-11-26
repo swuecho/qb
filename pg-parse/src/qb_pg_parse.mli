@@ -169,8 +169,8 @@ module Codegen : sig
       OCaml counterpart, such as [NUMERIC], enums or arrays, are read as text.
 
       [~bigint:`Int64] reads [BIGINT] (and [BIGSERIAL]) as [int64] with
-      [Qb.int64], for code whose ids are already [int64]; the default is
-      [int]. *)
+      [Qb.int64], for code whose ids are already [int64]; the default is [int].
+  *)
 
   val queries :
     ?bigint:[ `Int | `Int64 ] ->
@@ -183,15 +183,15 @@ module Codegen : sig
       [fetch_opt] or [fetch_one]. A query with no parameters is a plain value.
 
       Rows are a record, [<query>_row], with a field per column, or the bare
-      value when there is one column. Queries whose columns have the same
-      names and types, in the same order, share the first one's record. With [~tables:"Schema"], naming the module
-      holding {!ocaml}'s output for the same schema, a query whose columns are
-      all [t.*] gives those tables' own rows instead:
-      [SELECT c.*, u.* FROM comments c LEFT JOIN users u ...] is a
+      value when there is one column. Queries whose columns have the same names
+      and types, in the same order, share the first one's record. With
+      [~tables:"Schema"], naming the module holding {!ocaml}'s output for the
+      same schema, a query whose columns are all [t.*] gives those tables' own
+      rows instead: [SELECT c.*, u.* FROM comments c LEFT JOIN users u ...] is a
       [(Schema.Comments.t * Schema.Users.t option) Qb.stmt].
 
-      Each statement is named after its query ({!Qb.stmt_name}). [~bigint] is
-      as for {!ocaml}.
+      Each statement is named after its query ({!Qb.stmt_name}). [~bigint] is as
+      for {!ocaml}.
 
       [Error] when two columns of a record would have the same name. *)
 
@@ -218,4 +218,8 @@ module Codegen : sig
 
   val module_name : string -> string
   (** The OCaml module name used for a table or schema. *)
+
+  val quoted : string -> string
+  (** An OCaml quoted string literal [{sql|...|sql}] whose delimiter doesn't
+      appear in the text. *)
 end

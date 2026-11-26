@@ -1,0 +1,464 @@
+(* Conditions, assignments, joins, queries, and SQL rendering. *)
+
+open Ty
+open Table
+
+(* ---------- conditions: column, operator, plain OCaml value ---------- *)
+
+type op = Eq | Ne | Gt | Ge | Lt | Le
+
+let op_sql = function
+  | Eq -> "="
+  | Ne -> "<>"
+  | Gt -> ">"
+  | Ge -> ">="
+  | Lt -> "<"
+  | Le -> "<="
+
+type 'r cond =
+  | True : 'r cond
+  | Cmp : ('r, 'a) col * op * 'a -> 'r cond
+  | Cols : ('r, 'a) col * op * ('r, 'a) col -> 'r cond
+  | In : ('r, 'a) col * 'a list -> 'r cond
+  (* The pattern is a string, or [Some] of one for a nullable column. *)
+  | Like : ('r, 'a) col * 'a * bool -> 'r cond (* true: ILIKE *)
+  | And : 'r cond * 'r cond -> 'r cond
+  | Or : 'r cond * 'r cond -> 'r cond
+  | Not : 'r cond -> 'r cond
+
+let all_rows = True
+
+type 'r assign = Set : ('r, 'a) col * 'a -> 'r assign
+
+let set c v = Set (c, v)
+
+(* A new row: some columns of a table, the rest left to the database. *)
+type 'r values = { vtable : 'r table; vassigns : 'r assign list }
+
+let values vtable vassigns = { vtable; vassigns }
+
+module Ops = struct
+  let ( = ) c v = Cmp (c, Eq, v)
+  let ( <> ) c v = Cmp (c, Ne, v)
+  let ( > ) c v = Cmp (c, Gt, v)
+  let ( >= ) c v = Cmp (c, Ge, v)
+  let ( < ) c v = Cmp (c, Lt, v)
+  let ( <= ) c v = Cmp (c, Le, v)
+  let ( === ) a b = Cols (a, Eq, b)
+  let ( == ) a b = Cols (fst a, Eq, snd b)
+  let ( && ) a b = And (a, b)
+  let ( || ) a b = Or (a, b)
+  let not a = Not a
+  let is_in c vs = In (c, vs)
+  let not_in c vs = Not (In (c, vs))
+  let between c lo hi = And (Cmp (c, Ge, lo), Cmp (c, Le, hi))
+  let like c pattern = Like (c, pattern, false)
+  let ilike c pattern = Like (c, pattern, true)
+  let like_opt c pattern = Like (c, Some pattern, false)
+  let ilike_opt c pattern = Like (c, Some pattern, true)
+  let is_null c = Cmp (c, Eq, None)
+  let is_not_null c = Cmp (c, Ne, None)
+
+  (* A nullable column against a plain value. *)
+  let ( =? ) c v = Cmp (c, Eq, Some v)
+  let ( <>? ) c v = Cmp (c, Ne, Some v)
+  let ( >? ) c v = Cmp (c, Gt, Some v)
+  let ( >=? ) c v = Cmp (c, Ge, Some v)
+  let ( <? ) c v = Cmp (c, Lt, Some v)
+  let ( <=? ) c v = Cmp (c, Le, Some v)
+  let ( := ) c v = Set (c, v)
+end
+
+let rec render_cond : type r. out -> r cond -> unit =
+ fun o -> function
+  | True -> str o "1 = 1"
+  (* [email = None] must be IS NULL: in SQL, [= NULL] is never true. *)
+  | Cmp (c, Eq, v) when c.ty.is_null v ->
+      colname o c;
+      str o " IS NULL"
+  | Cmp (c, Ne, v) when c.ty.is_null v ->
+      colname o c;
+      str o " IS NOT NULL"
+  | Cmp (c, op, v) ->
+      colname o c;
+      str o (" " ^ op_sql op ^ " ");
+      param o c v
+  | Cols (a, op, b) ->
+      colname o a;
+      str o (" " ^ op_sql op ^ " ");
+      colname o b
+  | In (_, []) -> str o "1 = 0"
+  | In (c, vs) ->
+      o.variadic <- true;
+      colname o c;
+      str o " IN (";
+      sep o ", " (param o c) vs;
+      str o ")"
+  | Like (c, p, false) ->
+      colname o c;
+      str o " LIKE ";
+      param o c p
+  | Like (c, p, true) when o.dialect = Postgres ->
+      colname o c;
+      str o " ILIKE ";
+      param o c p
+  (* Only Postgres has ILIKE. *)
+  | Like (c, p, true) ->
+      str o "LOWER(";
+      colname o c;
+      str o ") LIKE LOWER(";
+      param o c p;
+      str o ")"
+  | And (a, b) -> binary o "AND" a b
+  | Or (a, b) -> binary o "OR" a b
+  | Not a ->
+      str o "NOT (";
+      render_cond o a;
+      str o ")"
+
+and binary : type r. out -> string -> r cond -> r cond -> unit =
+ fun o op a b ->
+  str o "(";
+  render_cond o a;
+  str o (" " ^ op ^ " ");
+  render_cond o b;
+  str o ")"
+
+let render_where o = function
+  | None | Some True -> ()
+  | Some w ->
+      str o " WHERE ";
+      render_cond o w
+
+(* ---------- joins ---------- *)
+
+let rec lift_cond : type r s. (r, s) lift -> r cond -> s cond =
+ fun l -> function
+  | True -> True
+  | Cmp (c, op, v) -> Cmp (l.lift c, op, v)
+  | Cols (a, op, b) -> Cols (l.lift a, op, l.lift b)
+  | In (c, vs) -> In (l.lift c, vs)
+  | Like (c, p, ci) -> Like (l.lift c, p, ci)
+  | And (a, b) -> And (lift_cond l a, lift_cond l b)
+  | Or (a, b) -> Or (lift_cond l a, lift_cond l b)
+  | Not a -> Not (lift_cond l a)
+
+let snd_cond c = lift_cond (lift R Stdlib.snd) c
+let fst_row t = lift_sel (lift L Stdlib.fst) t.row
+let snd_row t = lift_sel (lift R Stdlib.snd) t.row
+
+let render_from : type r. out -> r table -> side list -> unit =
+ fun o t path ->
+  match t.joined with
+  | Some f -> f o path
+  | None ->
+      str o (table_name o.dialect t);
+      if path <> [] then (
+        str o " AS ";
+        name o (alias path))
+
+let make_join keyword left right ~on row =
+  let render o path =
+    render_from o left (path @ [ L ]);
+    str o keyword;
+    (* [a JOIN (b JOIN c ON ...) ON ...] *)
+    let nested = right.joined <> None in
+    if nested then str o "(";
+    render_from o right (path @ [ R ]);
+    if nested then str o ")";
+    str o " ON ";
+    let outer = o.prefix in
+    o.prefix <- path;
+    render_cond o on;
+    o.prefix <- outer
+  in
+  match decoder row with
+  | Dec (_, _, cols) ->
+      let name = left.tname ^ "_" ^ right.tname in
+      { tschema = None; tname = name; row; cols; joined = Some render }
+
+(* ---------- queries ---------- *)
+
+type filtered
+type unfiltered
+type plain
+type joined
+type 'r order = Order : ('r, _) col * string -> 'r order
+
+(* What a query returns. [Plain]: a selection of its table's columns.
+   [Joined]: a selection of the left table's columns paired with the right
+   table's rows ('c is the right row, or an option of it for a left join).
+
+   The join lives here, not in the query's row type: a joined query is still
+   a query on its left table, so [where] and [order_by] take that table's
+   own columns before and after the join alike. Only when SQL is made
+   ([flatten]) does it become a query on the pair, with every column lifted
+   onto its side. *)
+type ('r, 'a) output =
+  | Plain : ('r, 'a) sel -> ('r, 'a) output
+  | Joined : {
+      keyword : string;
+      left : ('r, 's) sel;
+      right : 'b table;
+      on : ('r * 'b) cond;
+      right_sel : ('r * 'b, 'c) sel;
+    }
+      -> ('r, 's * 'c) output
+
+(* ['r] is the (left) table's row, ['a] is what this query returns, ['w]
+   records whether [where] was called. *)
+type ('r, 'a, 'w) query = {
+  table : 'r table;
+  out : ('r, 'a) output;
+  where : 'r cond option;
+  order : 'r order list;
+  limit : int option;
+  offset : int option;
+}
+
+let from table =
+  {
+    table;
+    out = Plain table.row;
+    where = None;
+    order = [];
+    limit = None;
+    offset = None;
+  }
+
+let where cond q =
+  let where =
+    match (q.where, cond) with
+    | None, c | Some True, c | Some c, True -> c
+    | Some w, c -> And (w, c)
+  in
+  { q with where = Some where }
+
+let select : type r a b w. (r, b) sel -> (r, a, w) query -> (r, b, w) query =
+ fun sel q ->
+  check_nonempty "Qb.select" sel;
+  match q.out with
+  | Joined _ ->
+      invalid_arg
+        "Qb.select: select before the join; after it, the right table would be \
+         lost"
+  | Plain _ -> { q with out = Plain sel }
+
+let asc c = Order (c, "ASC")
+let desc c = Order (c, "DESC")
+let order_by order q = { q with order }
+let limit n q = { q with limit = Some n }
+let offset n q = { q with offset = Some n }
+
+(* A join is recorded in the query's output; see [output]. The right
+   table's own condition goes into the ON, which for a left join is also what
+   keeps the unmatched left rows. *)
+let join_with : type r s b c w v.
+    string ->
+    b table ->
+    ?where:b cond ->
+    on:(r * b) cond ->
+    (r * b, c) sel ->
+    (r, s, w) query ->
+    (r, s * c, v) query =
+ fun keyword right ?where ~on right_sel q ->
+  match q.out with
+  | Joined _ ->
+      invalid_arg
+        "Qb: one join per query; for three tables or more, write the SQL"
+  | Plain left ->
+      let on = match where with None -> on | Some w -> And (on, snd_cond w) in
+      { q with out = Joined { keyword; left; right; on; right_sel } }
+
+let join ?where right ~on q =
+  join_with " JOIN " right ?where ~on (snd_row right) q
+
+let left_join ?where right ~on q =
+  join_with " LEFT JOIN " right ?where ~on (Sel.Expr (Opt (snd_row right))) q
+
+let lift_order l (Order (c, dir)) = Order (l.lift c, dir)
+
+(* The query as SQL sees it: a joined query becomes a plain query on the
+   pair, its where, order and selection lifted onto the left side. *)
+type 'a flat = Flat : ('r, 'a, 'w) query -> 'a flat
+
+let flatten : type r a w. (r, a, w) query -> a flat =
+ fun q ->
+  match q.out with
+  | Plain _ -> Flat q
+  | Joined { keyword; left; right; on; right_sel } ->
+      let l = lift L Stdlib.fst in
+      let table =
+        make_join keyword q.table right ~on
+          (Sel.Expr (Both (fst_row q.table, snd_row right)))
+      in
+      Flat
+        {
+          table;
+          out = Plain (Sel.Expr (Both (lift_sel l left, right_sel)));
+          where = Option.map (lift_cond l) q.where;
+          order = List.map (lift_order l) q.order;
+          limit = q.limit;
+          offset = q.offset;
+        }
+
+let not_joined : type r a w. string -> (r, a, w) query -> unit =
+ fun fn q ->
+  match q.out with
+  | Joined _ -> invalid_arg (fn ^ ": a join is not a table")
+  | Plain _ -> ()
+
+let render_select o q cols =
+  str o "SELECT ";
+  qualified_names o cols;
+  str o " FROM ";
+  render_from o q.table [];
+  render_where o q.where;
+  if q.order <> [] then (
+    str o " ORDER BY ";
+    sep o ", "
+      (fun (Order (c, dir)) ->
+        colname o c;
+        str o (" " ^ dir))
+      q.order);
+  Option.iter (fun n -> str o (Printf.sprintf " LIMIT %d" n)) q.limit;
+  Option.iter (fun n -> str o (Printf.sprintf " OFFSET %d" n)) q.offset
+
+(* A SELECT ready to render: Caqti's row type, how to build the result from
+   it, and the renderer. *)
+type 'a prepared =
+  | Prepared : 'x Caqti_type.t * ('x -> 'a) * (out -> unit) -> 'a prepared
+
+let prepare : type r a w. ?limit:int -> (r, a, w) query -> a prepared =
+ fun ?limit q ->
+  match flatten q with
+  | Flat q -> (
+      let q =
+        match limit with None -> q | Some n -> { q with limit = Some n }
+      in
+      match q.out with
+      | Joined _ -> assert false (* flatten leaves none *)
+      | Plain sel -> (
+          match decoder sel with
+          | Dec (rt, decode, cols) ->
+              Prepared (rt, decode, fun o -> render_select o q cols)))
+
+let to_sql ?(dialect = Postgres) q =
+  let o = out dialect in
+  (match prepare q with Prepared (_, _, render) -> render o);
+  Buffer.contents o.buf
+
+let render_count o q =
+  match flatten q with
+  | Flat q ->
+      str o "SELECT COUNT(*) FROM ";
+      render_from o q.table [];
+      render_where o q.where
+
+let render_insert o t cols values =
+  base "Qb: insert" t;
+  str o "INSERT INTO ";
+  str o (table_name o.dialect t);
+  match (cols, o.dialect) with
+  | [], Mysql -> str o " () VALUES ()"
+  | [], (Postgres | Sqlite) -> str o " DEFAULT VALUES"
+  | _ ->
+      str o " (";
+      col_names o cols;
+      str o ") VALUES (";
+      sep o ", " (fun f -> f ()) values;
+      str o ")"
+
+let render_insert_many o t rows =
+  base "Qb: insert_many" t;
+  o.variadic <- true;
+  str o "INSERT INTO ";
+  str o (table_name o.dialect t);
+  str o " (";
+  col_names o t.cols;
+  str o ") VALUES ";
+  sep o ", "
+    (fun row ->
+      str o "(";
+      sep o ", " (fun (Any c) -> param o c (c.get row)) t.cols;
+      str o ")")
+    rows
+
+let render_returning o sel =
+  match decoder sel with
+  | Dec (_, _, cols) ->
+      str o " RETURNING ";
+      col_names o cols
+
+let render_update o assigns q =
+  not_joined "Qb: update" q;
+  base "Qb: update" q.table;
+  str o "UPDATE ";
+  str o (table_name o.dialect q.table);
+  str o " SET ";
+  sep o ", "
+    (fun (Set (c, v)) ->
+      name o c.name;
+      str o " = ";
+      param o c v)
+    assigns;
+  render_where o q.where
+
+let render_delete o q =
+  not_joined "Qb: delete" q;
+  base "Qb: delete" q.table;
+  str o "DELETE FROM ";
+  str o (table_name o.dialect q.table);
+  render_where o q.where
+
+(* The text of each statement {!Runner.Make} runs, without running it. *)
+let sql_of dialect f =
+  let o = out dialect in
+  f o;
+  Buffer.contents o.buf
+
+let count_sql ?(dialect = Postgres) q =
+  sql_of dialect (fun o -> render_count o q)
+
+let insert_sql ?(dialect = Postgres) t row =
+  sql_of dialect (fun o ->
+      render_insert o t t.cols
+        (List.map (fun (Any c) () -> param o c (c.get row)) t.cols))
+
+let insert_returning_sql ?(dialect = Postgres) t assigns returning =
+  check_nonempty "Qb.insert_returning_sql" returning;
+  match decoder returning with
+  | Dec (_, _, cols) ->
+      sql_of dialect (fun o ->
+          render_insert o t
+            (List.map (fun (Set (c, _)) -> Any c) assigns)
+            (List.map (fun (Set (c, v)) () -> param o c v) assigns);
+          str o " RETURNING ";
+          col_names o cols)
+
+let insert_values_sql ?dialect v =
+  insert_returning_sql ?dialect v.vtable v.vassigns v.vtable.row
+
+let insert_many_sql ?(dialect = Postgres) t rows =
+  if rows = [] then invalid_arg "Qb.insert_many_sql: no rows";
+  sql_of dialect (fun o -> render_insert_many o t rows)
+
+let update_sql ?(dialect = Postgres) assigns q =
+  if assigns = [] then invalid_arg "Qb.update_sql: no assignments";
+  sql_of dialect (fun o -> render_update o assigns q)
+
+let delete_sql ?(dialect = Postgres) q =
+  sql_of dialect (fun o -> render_delete o q)
+
+let update_returning_sql ?(dialect = Postgres) assigns q returning =
+  if assigns = [] then invalid_arg "Qb.update_returning_sql: no assignments";
+  check_nonempty "Qb.update_returning_sql" returning;
+  sql_of dialect (fun o ->
+      render_update o assigns q;
+      render_returning o returning)
+
+let delete_returning_sql ?(dialect = Postgres) q returning =
+  check_nonempty "Qb.delete_returning_sql" returning;
+  sql_of dialect (fun o ->
+      render_delete o q;
+      render_returning o returning)
