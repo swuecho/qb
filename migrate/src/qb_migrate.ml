@@ -70,10 +70,16 @@ module type DB = Caqti_blocking.CONNECTION
 let db_error r = Result.map_error (fun e -> `Db (e :> Caqti_error.t)) r
 
 (* A migration's statement is sent as it is: Caqti reads nothing into its
-   [?] or [$]. *)
+   [?] or [$]. Statements that return rows (e.g. pg_dump's
+   [SELECT pg_catalog.set_config(...)]) use [literal_rows] so Caqti doesn't
+   reject the returned tuples. *)
 let literal sql =
   Caqti_request.create ~oneshot:true Caqti_type.unit Caqti_type.unit
     Caqti_mult.zero (fun _ -> Caqti_query.L sql)
+
+let literal_rows sql =
+  Caqti_request.create ~oneshot:true Caqti_type.unit Caqti_type.unit
+    Caqti_mult.zero_or_more (fun _ -> Caqti_query.L sql)
 
 module Q = struct
   open Caqti_request.Infix
@@ -199,19 +205,35 @@ let no_transaction m =
   in
   String.trim first = "-- qb:no-transaction"
 
-(* A migration's statements. One that runs in a transaction can't have its
-   own: its COMMIT would end the runner's, and what follows, with the record
-   that it was applied, would no longer be undone together. *)
+(* Statements for which Postgres replies with Tuples_ok rather than
+   Command_ok. *)
+let returns_rows = function
+  | `Assoc [ (("SelectStmt" | "VariableShowStmt" | "ExplainStmt"), _) ] -> true
+  | `Assoc [ (("InsertStmt" | "UpdateStmt" | "DeleteStmt"), `Assoc kv) ] ->
+      List.mem_assoc "returningClause" kv || List.mem_assoc "returningList" kv
+  | _ -> false
+
+(* A migration's statements, paired with whether each returns rows. One that
+   runs in a transaction can't have its own: its COMMIT would end the runner's,
+   and what follows, with the record that it was applied, would no longer be
+   undone together. *)
 let split m =
   let sql = Pg.strip_psql_meta m.sql in
   let parsed r =
     Result.map_error (fun e -> `Invalid (m.name, Pg.error_to_string ~sql e)) r
   in
-  let* nodes = parsed (Pg.statements sql) in
+  let field k = function `Assoc kv -> List.assoc_opt k kv | _ -> None in
+  let* tree = parsed (Pg.parse sql) in
+  let raw_stmts =
+    match field "stmts" tree with Some (`List stmts) -> stmts | _ -> []
+  in
   let own_transaction =
     List.exists
-      (function `Assoc [ ("TransactionStmt", _) ] -> true | _ -> false)
-      nodes
+      (fun s ->
+        match field "stmt" s with
+        | Some (`Assoc [ ("TransactionStmt", _) ]) -> true
+        | _ -> false)
+      raw_stmts
   in
   if own_transaction && not (no_transaction m) then
     Error
@@ -220,7 +242,27 @@ let split m =
            "it has its own BEGIN or COMMIT, and a migration already runs in a \
             transaction: take them out, or make -- qb:no-transaction its first \
             line" ))
-  else parsed (Pg.split sql)
+  else
+    let stmts =
+      List.filter_map
+        (fun s ->
+          let int k = match field k s with Some (`Int i) -> i | _ -> 0 in
+          let at = int "stmt_location" in
+          let len =
+            match int "stmt_len" with 0 -> String.length sql - at | n -> n
+          in
+          match String.trim (String.sub sql at len) with
+          | "" -> None
+          | text ->
+              let has_rows =
+                match field "stmt" s with
+                | Some node -> returns_rows node
+                | None -> false
+              in
+              Some (text, has_rows))
+        raw_stmts
+    in
+    Ok stmts
 
 (* What stops a run before anything is applied. *)
 let check ~out_of_order ms applied =
@@ -258,8 +300,12 @@ let apply ~schema ~saved_path (module Db : DB) m stmts =
   in
   let rec exec ~kept = function
     | [] -> Ok ()
-    | stmt :: rest -> (
-        match Db.exec (literal stmt) () with
+    | (stmt, has_rows) :: rest -> (
+        let r =
+          if has_rows then Db.call ~f:(fun _ -> Ok ()) (literal_rows stmt) ()
+          else Db.exec (literal stmt) ()
+        in
+        match r with
         | Ok () -> exec ~kept rest
         | Error e -> Error (failed stmt e ~kept))
   in

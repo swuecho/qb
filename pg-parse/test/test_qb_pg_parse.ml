@@ -752,7 +752,7 @@ let codegen_options () =
           NULL")
   in
   Alcotest.(check string)
-    "COALESCE in WHERE types param" "text" (List.hd coal_q.params).ty.name;
+    "COALESCE in WHERE types param" "varchar" (List.hd coal_q.params).ty.name;
   let case_q =
     ok_or_fail "case in where"
       (Query.one st
@@ -760,7 +760,7 @@ let codegen_options () =
           :fallback END IS NOT NULL")
   in
   Alcotest.(check string)
-    "CASE in WHERE types param" "text" (List.hd case_q.params).ty.name
+    "CASE in WHERE types param" "varchar" (List.hd case_q.params).ty.name
 
 (* Two accounts and three articles, for the generated queries. *)
 let seed_queries ~insert_account ~insert_article =

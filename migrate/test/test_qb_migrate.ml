@@ -311,7 +311,7 @@ CREATE TABLE wide (
     [
       "wide.code: VARCHAR(10) in the migrations, varchar(20) in the database";
       "wide.fixed: CHAR(3) in the migrations, bpchar(4) in the database";
-      "wide.one: CHAR in the migrations, bpchar(5) in the database";
+      "wide.one: CHAR(1) in the migrations, bpchar(5) in the database";
       "wide.loose: VARCHAR in the migrations, varchar(9) in the database";
       "wide.amount: NUMERIC(10,2) in the migrations, numeric(12,2) in the \
        database";
