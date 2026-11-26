@@ -29,8 +29,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and automatic `file.ml:line` statement names in `Qb.src` debug logs.
 - **`qb-migrate`**: apply and verify `migrations/*.sql` against PostgreSQL
   (with SHA-256 checksums, `pg_dump` `search_path` and tuple-returning
-  statement support, and atomic `baseline`), as a library or with the
-  `qb-migrate` command.
+  statement support, atomic `baseline`, read-only `plan` / `up --dry-run`, and
+  `status --check` for CI/deploy gates), as a library or with the `qb-migrate`
+  command.
 - A tutorial, an SQL reference and a migrations reference under `doc/`, plus
   runnable examples under `example/`.
 - CI on OCaml 4.14 and 5.4 (with cached `libpg_query` builds), formatting

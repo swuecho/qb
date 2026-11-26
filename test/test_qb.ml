@@ -1184,7 +1184,21 @@ let test_cast () =
   Alcotest.(check (option int64))
     "unlisted is ignored" None (C.get Things.big cs);
   Alcotest.(check string)
+    "unlisted param does not leak into input" "" (C.input Things.big cs);
+  Alcotest.(check string)
     "input keeps what was typed" "0x1f" (C.input Things.id cs);
+  List.iter
+    (fun bad_date ->
+      let cs_date =
+        C.(
+          for_insert Things.table
+          |> cast [ ("day", bad_date) ] [ field Things.day ])
+      in
+      Alcotest.(check error_list)
+        ("malformed date rejected: " ^ bad_date)
+        [ ("day", "is invalid") ]
+        (errors cs_date))
+    [ "+202-1-2"; "2026- 1-02"; "2026-1-2"; "2026-02-30" ];
   (* Blank: None for a nullable column, an error for any other. *)
   let cs =
     C.(
@@ -1325,6 +1339,17 @@ let test_changeset_db db =
     "unique"
     [ ("email", "has already been taken") ]
     (invalid (insert [ ("email", "a@x.org"); ("age", "31") ]));
+  (* Primary-key duplicate matched via unique_constraint on both SQLite and
+     Postgres. *)
+  Alcotest.(check error_list)
+    "primary key unique constraint"
+    [ ("id", "has already been taken") ]
+    (invalid
+       (Blocking.insert_changeset db
+          C.(
+            for_insert Users.table |> put Users.id 1 |> put Users.name "Dup"
+            |> put Users.age 20
+            |> unique_constraint ~name:"users_pkey" Users.id)));
   Alcotest.(check error_list)
     "foreign key"
     [ ("owner_id", "does not exist") ]

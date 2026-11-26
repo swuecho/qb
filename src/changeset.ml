@@ -114,12 +114,16 @@ let put c v cs =
   | _ -> { cs with changes = cs.changes @ [ Set (c, v) ] }
 
 let cast params fields cs =
+  let allowed = List.map (fun (Field c) -> c.name) fields in
+  let cast_params = List.filter (fun (k, _) -> List.mem k allowed) params in
   let cs =
     {
       cs with
       params =
-        params
-        @ List.filter (fun (k, _) -> not (List.mem_assoc k params)) cs.params;
+        cast_params
+        @ List.filter
+            (fun (k, _) -> not (List.mem_assoc k cast_params))
+            cs.params;
     }
   in
   List.fold_left
@@ -368,6 +372,13 @@ let on_error cs e =
   let con =
     match violation e with
     | Some ((`Unique | `Foreign_key | `Check) as kind) -> found kind
+    (* SQLite reports duplicate PRIMARY KEY as SQLITE_CONSTRAINT_PRIMARYKEY,
+       which Caqti maps to [`Other] rather than [`Unique], even though its
+       message is "UNIQUE constraint failed: <table>.<col>". *)
+    | Some `Other
+      when index_from (Caqti_error.show e) 0 "UNIQUE constraint failed: "
+           <> None ->
+        found `Unique
     | Some (`Not_null | `Other) | None -> None
   in
   Option.map

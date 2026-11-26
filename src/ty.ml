@@ -43,11 +43,13 @@ let parse_float s =
 
 (* The shortest text that reads back as the same float. *)
 let show_float f =
-  let rec go p =
-    let s = Printf.sprintf "%.*g" p f in
-    if p >= 17 || float_of_string s = f then s else go (p + 1)
-  in
-  go 1
+  if not (Float.is_finite f) then Printf.sprintf "%g" f
+  else
+    let rec go p =
+      let s = Printf.sprintf "%.*g" p f in
+      if p >= 17 || float_of_string s = f then s else go (p + 1)
+    in
+    go 1
 
 let parse_bool s =
   match String.lowercase_ascii (String.trim s) with
@@ -77,11 +79,19 @@ let show_ptime t =
   Ptime.to_rfc3339 ~tz_offset_s:0 ~frac_s t
 
 let parse_date s =
-  match
-    Scanf.sscanf (String.trim s) "%4d-%2d-%2d%!" (fun y m d -> (y, m, d))
-  with
-  | ymd -> Ptime.of_date ymd
-  | exception (Scanf.Scan_failure _ | Failure _ | End_of_file) -> None
+  let s = String.trim s in
+  let digits i len = String.for_all Sql_tokens.is_digit (String.sub s i len) in
+  if
+    String.length s = 10
+    && s.[4] = '-'
+    && s.[7] = '-'
+    && digits 0 4 && digits 5 2 && digits 8 2
+  then
+    let y = int_of_string (String.sub s 0 4)
+    and m = int_of_string (String.sub s 5 2)
+    and d = int_of_string (String.sub s 8 2) in
+    Ptime.of_date (y, m, d)
+  else None
 
 let show_date t =
   let y, m, d = Ptime.to_date t in

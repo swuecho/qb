@@ -33,10 +33,13 @@ The database is `--db URL` or the `DATABASE_URL` variable. The folder is
 
 Each command exits with 0 when all is well. `up` and `verify` exit with 1
 when the database differs from the migrations; `status` exits with 1 when a
-file is `CHANGED` or `MISSING`.
+file is `CHANGED` or `MISSING`, or with `--check` when any file is `pending`
+too (handy for CI or deploy readiness checks).
 
-`up` takes two flags: `--out-of-order` (see
-[What stops a run](#what-stops-a-run)) and `--no-verify`.
+`up` takes three flags: `--out-of-order` (see
+[What stops a run](#what-stops-a-run)), `--no-verify`, and `--dry-run`
+(validates pending migrations and prints what would run without touching the
+database).
 
 ## Files
 
@@ -150,6 +153,7 @@ match Qb_migrate.of_dir "migrations" with
 | Function | Result |
 | --- | --- |
 | `of_dir dir` | The folder's `*.sql` files, in name order |
+| `plan db migrations` | The pending names that would run (validated, writes nothing); `~out_of_order:true` as the flag |
 | `run db migrations` | The names applied; `~out_of_order:true` as the flag |
 | `status db migrations` | Each migration's status; writes nothing |
 | `verify db migrations` | The differences; `[]` when there are none |

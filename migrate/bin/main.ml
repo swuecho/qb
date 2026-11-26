@@ -44,19 +44,26 @@ let report_differences = function
       List.iter (fun d -> prerr_endline ("  " ^ d)) diffs;
       1
 
-let up url dir out_of_order no_verify =
+let up url dir out_of_order no_verify dry_run =
   finish
     (with_db url dir (fun db ms ->
-         let* applied = Qb_migrate.run ~out_of_order db ms in
-         (match applied with
-         | [] -> print_endline "nothing to apply"
-         | names -> List.iter (Printf.printf "applied %s\n") names);
-         if no_verify then Ok 0
+         if dry_run then (
+           let* pending = Qb_migrate.plan ~out_of_order db ms in
+           (match pending with
+           | [] -> print_endline "nothing to apply"
+           | names -> List.iter (Printf.printf "would apply %s\n") names);
+           Ok 0)
          else
-           let* diffs = Qb_migrate.verify db ms in
-           Ok (report_differences diffs)))
+           let* applied = Qb_migrate.run ~out_of_order db ms in
+           (match applied with
+           | [] -> print_endline "nothing to apply"
+           | names -> List.iter (Printf.printf "applied %s\n") names);
+           if no_verify then Ok 0
+           else
+             let* diffs = Qb_migrate.verify db ms in
+             Ok (report_differences diffs)))
 
-let status url dir =
+let status url dir check =
   finish
     (with_db url dir (fun db ms ->
          let* st = Qb_migrate.status db ms in
@@ -74,12 +81,17 @@ let status url dir =
                | Applied t | Changed t | Missing t -> "  " ^ time t
                | Pending -> ""))
            st;
-         (* Changed and missing migrations stop [up]: say so in the code. *)
+         (* Changed and missing migrations stop [up]: say so in the code. With
+            --check, pending migrations also fail the check (for CI / deploy
+            gates). *)
          Ok
            (if
               List.exists
                 (fun (_, (s : Qb_migrate.status)) ->
-                  match s with Changed _ | Missing _ -> true | _ -> false)
+                  match s with
+                  | Changed _ | Missing _ -> true
+                  | Pending -> check
+                  | Applied _ -> false)
                 st
             then 1
             else 0)))
@@ -191,18 +203,34 @@ let up_cmd =
       & info [ "no-verify" ]
           ~doc:"Don't compare the database with the migrations afterwards.")
   in
+  let dry_run =
+    Arg.(
+      value & flag
+      & info [ "dry-run" ]
+          ~doc:
+            "Validate pending migrations and print what would run without \
+             touching the database.")
+  in
   Cmd.v
     (Cmd.info "up"
        ~doc:
          "Apply the pending migrations, each in a transaction, then check that \
           the database matches.")
-    Term.(const up $ db $ dir $ out_of_order $ no_verify)
+    Term.(const up $ db $ dir $ out_of_order $ no_verify $ dry_run)
 
 let status_cmd =
+  let check =
+    Arg.(
+      value & flag
+      & info [ "check" ]
+          ~doc:
+            "Also exit with 1 when any migrations are pending (for CI or \
+             deploy checks).")
+  in
   Cmd.v
     (Cmd.info "status"
        ~doc:"List each migration: applied, pending, changed or missing.")
-    Term.(const status $ db $ dir)
+    Term.(const status $ db $ dir $ check)
 
 let verify_cmd =
   Cmd.v

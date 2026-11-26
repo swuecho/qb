@@ -39,3 +39,11 @@ is set.
   $ env -u DATABASE_URL qb-migrate status
   qb-migrate: no database: give --db URL, or set DATABASE_URL
   [1]
+  $ env -u DATABASE_URL qb-migrate status --check
+  qb-migrate: no database: give --db URL, or set DATABASE_URL
+  [1]
+  $ env -u DATABASE_URL qb-migrate up --dry-run
+  qb-migrate: no database: give --db URL, or set DATABASE_URL
+  [1]
+  $ qb-migrate up --help=plain | grep -q -- '--dry-run'
+  $ qb-migrate status --help=plain | grep -q -- '--check'

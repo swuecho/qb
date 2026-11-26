@@ -336,12 +336,7 @@ let apply ~schema ~saved_path (module Db : DB) m stmts =
         restore_path ();
         raise e
 
-let run ?(out_of_order = false) ((module Db : DB) as db) ms =
-  with_lock db @@ fun () ->
-  let* schema = db_error (Db.find Q.current_schema ()) in
-  let* saved_path = db_error (Db.find Q.search_path ()) in
-  let* () = db_error (Db.exec Q.create_table ()) in
-  let* applied = db_error (Db.collect_list Q.applied ()) in
+let parse_pending ~out_of_order ms applied =
   let* pending = check ~out_of_order ms applied in
   let pending = List.filter (fun m -> List.mem m.name pending) ms in
   (* Every pending migration must parse before the first is applied. *)
@@ -353,12 +348,26 @@ let run ?(out_of_order = false) ((module Db : DB) as db) ms =
         Ok ((m, stmts) :: acc))
       (Ok []) pending
   in
+  Ok (List.rev parsed)
+
+let plan ?(out_of_order = false) db ms =
+  let* applied = applied db in
+  let* parsed = parse_pending ~out_of_order ms applied in
+  Ok (List.map (fun (m, _) -> m.name) parsed)
+
+let run ?(out_of_order = false) ((module Db : DB) as db) ms =
+  with_lock db @@ fun () ->
+  let* schema = db_error (Db.find Q.current_schema ()) in
+  let* saved_path = db_error (Db.find Q.search_path ()) in
+  let* () = db_error (Db.exec Q.create_table ()) in
+  let* applied = db_error (Db.collect_list Q.applied ()) in
+  let* parsed = parse_pending ~out_of_order ms applied in
   List.fold_left
     (fun acc (m, stmts) ->
       let* acc = acc in
       let* () = apply ~schema ~saved_path db m stmts in
       Ok (m.name :: acc))
-    (Ok []) (List.rev parsed)
+    (Ok []) parsed
   |> Result.map List.rev
 
 (* ---------- verify ---------- *)

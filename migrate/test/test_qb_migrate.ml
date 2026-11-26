@@ -348,6 +348,40 @@ let test_baseline db =
   strings "then only new ones run" [ "003_more.sql" ]
     (ok (run db [ init; books; more ]))
 
+let test_plan db =
+  strings "plans pending before qb_migrations exists"
+    [ "001_init.sql"; "002_books.sql" ]
+    (ok (plan db [ init; books ]));
+  Alcotest.(check bool)
+    "does not create qb_migrations" false
+    (has_table db "qb_migrations");
+  Alcotest.(check bool) "does not apply tables" false (has_table db "authors");
+  (match plan db [ init; m "002_bad.sql" "CREATE TABEL nope (x INT)" ] with
+  | Error (`Invalid ("002_bad.sql", _)) -> ()
+  | Ok _ -> Alcotest.fail "plan accepted unparsable migration"
+  | Error e -> Alcotest.fail (error_to_string e));
+  (match
+     plan db [ init; m "002_tx.sql" "BEGIN; CREATE TABLE x (id INT); COMMIT;" ]
+   with
+  | Error (`Invalid ("002_tx.sql", _)) -> ()
+  | Ok _ -> Alcotest.fail "plan accepted stray BEGIN/COMMIT"
+  | Error e -> Alcotest.fail (error_to_string e));
+  ignore (ok (run db [ init ]));
+  strings "plans only remaining pending" [ "002_books.sql" ]
+    (ok (plan db [ init; books ]));
+  Alcotest.(check bool) "still does not apply" false (has_table db "books");
+  (match plan db [ { init with sql = init.sql ^ "\n-- edited" }; books ] with
+  | Error (`Changed "001_init.sql") -> ()
+  | _ -> Alcotest.fail "plan should reject changed migration");
+  ignore (ok (run db [ init; books ]));
+  let late = m "0015_late.sql" "CREATE TABLE late (x INT)" in
+  (match plan db [ init; late; books ] with
+  | Error (`Out_of_order ("0015_late.sql", "002_books.sql")) -> ()
+  | _ -> Alcotest.fail "plan should reject out-of-order migration");
+  strings "out_of_order allowed when asked" [ "0015_late.sql" ]
+    (ok (plan ~out_of_order:true db [ init; late; books ]));
+  strings "nothing pending when up to date" [] (ok (plan db [ init; books ]))
+
 let () =
   let t name f = Alcotest.test_case name `Quick f in
   Alcotest.run "qb-migrate"
@@ -360,6 +394,7 @@ let () =
         | Some url ->
             [
               t "run" (with_db url test_run);
+              t "plan" (with_db url test_plan);
               t "refusals" (with_db url test_refusals);
               t "failures" (with_db url test_failures);
               t "verify" (with_db url test_verify);

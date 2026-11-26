@@ -210,10 +210,15 @@ let create ~default_schema st body =
     let t = if pk = [] then t else set_pk pk t in
     { tables = st.tables @ [ t ]; warnings = st.warnings @ !warnings }
 
-let update_table ~default_schema st rel f =
+let update_table ~default_schema ?(missing_ok = false) st rel f =
   match List.find_opt (same_table ~default_schema rel) st.tables with
   | None ->
-      { st with warnings = st.warnings @ [ "unknown table " ^ qualified rel ] }
+      if missing_ok then st
+      else
+        {
+          st with
+          warnings = st.warnings @ [ "unknown table " ^ qualified rel ];
+        }
   | Some _ ->
       let warnings = ref [] in
       let warn m = warnings := !warnings @ [ qualified rel ^ ": " ^ m ] in
@@ -285,7 +290,9 @@ let alter_cmd warn (t : table) cmd =
           })
         warn t
   | Some "AT_AddIdentity" ->
-      map_column name (fun (c : column) -> { c with generated = true }) warn t
+      map_column name
+        (fun (c : column) -> { c with generated = true; not_null = true })
+        warn t
   | Some "AT_DropIdentity" ->
       map_column name (fun (c : column) -> { c with generated = false }) warn t
   | Some "AT_AddConstraint" -> (
@@ -332,18 +339,19 @@ let apply ~default_schema st stmt =
             match node c with Some ("AlterTableCmd", c) -> Some c | _ -> None)
           (list "cmds" body)
       in
-      update_table ~default_schema st (relation body) (fun warn t ->
-          List.fold_left (alter_cmd warn) t cmds)
+      update_table ~default_schema ~missing_ok:(bool "missing_ok" body) st
+        (relation body) (fun warn t -> List.fold_left (alter_cmd warn) t cmds)
   | Some ("RenameStmt", body) -> (
       let rel = relation body in
+      let missing_ok = bool "missing_ok" body in
       let newname = Option.value (str "newname" body) ~default:"" in
       match str "renameType" body with
       | Some "OBJECT_TABLE" ->
-          update_table ~default_schema st rel (fun _ t ->
+          update_table ~default_schema ~missing_ok st rel (fun _ t ->
               { t with name = newname })
       | Some "OBJECT_COLUMN" ->
           let old = Option.value (str "subname" body) ~default:"" in
-          update_table ~default_schema st rel (fun warn t ->
+          update_table ~default_schema ~missing_ok st rel (fun warn t ->
               let t =
                 map_column old
                   (fun (c : column) -> { c with name = newname })

@@ -54,6 +54,13 @@ val status : db -> migration list -> ((string * status) list, error) result
 (** Every migration, in order, then those applied but missing from the list.
     Writes nothing. *)
 
+val plan :
+  ?out_of_order:bool -> db -> migration list -> (string list, error) result
+(** Validates the pending migrations as {!run} would (checking for changed,
+    missing, out-of-order, or unparsable migrations and stray [BEGIN]/[COMMIT]),
+    and returns the names that would be applied in order. Writes nothing and
+    does not create [qb_migrations]. *)
+
 val run :
   ?out_of_order:bool -> db -> migration list -> (string list, error) result
 (** Applies the pending migrations in order and returns their names. Nothing is

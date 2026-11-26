@@ -282,12 +282,16 @@ let composite_and_warnings () =
     {|CREATE TABLE m (a INT, b INT, c TEXT[], PRIMARY KEY (a, b));
       ALTER TABLE m DROP CONSTRAINT m_pkey;
       ALTER TABLE nope ADD COLUMN x INT;
+      ALTER TABLE IF EXISTS nope2 ADD COLUMN x INT;
+      ALTER TABLE m ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY;
       CREATE TABLE IF NOT EXISTS m (z INT);|}
   in
   let st = ok_or_fail sql (Schema.of_sql sql) in
   let m = table st "m" in
   Alcotest.(check (list string)) "composite pk" [ "a"; "b" ] m.primary_key;
   Alcotest.(check bool) "pk columns are not null" true (col m "a").not_null;
+  Alcotest.(check bool) "ADD IDENTITY sets generated" true (col m "b").generated;
+  Alcotest.(check bool) "ADD IDENTITY sets not_null" true (col m "b").not_null;
   Alcotest.(check int) "array" 1 (col m "c").ty.array_dims;
   Alcotest.(check (list string))
     "IF NOT EXISTS kept the first" [ "a"; "b"; "c" ] (col_names m);
