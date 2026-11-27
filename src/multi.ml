@@ -174,7 +174,9 @@ type query_body =
     }
 
 type 'a t =
-  | Query : 'x Caqti_type.t * ('x -> 'a) * query_body * 'a single_ty -> 'a t
+  | Query :
+      'x Caqti_type.t * ('x -> 'a) * query_body * 'a single_ty * string option
+      -> 'a t
 
 and 'a single_ty = Single : 'a ty -> 'a single_ty | Multi : _ single_ty
 
@@ -223,6 +225,14 @@ let return x st = (st, x)
 let ( let* ) m f st =
   let st, x = m st in
   f x st
+
+let ( &> ) a b st =
+  let st, () = a st in
+  b st
+
+let map_build f m st =
+  let st, x = m st in
+  (st, f x)
 
 let check_from st =
   if Option.is_some st.st_from then
@@ -558,6 +568,16 @@ let offset n st =
   if n < 0 then invalid_arg "Qb.Query.offset: negative offset";
   ({ st with st_offset = Some n }, ())
 
+let paginate ~page ~per_page st =
+  if page < 1 then invalid_arg "Qb.Query.paginate: page must be >= 1";
+  if per_page < 0 then invalid_arg "Qb.Query.paginate: per_page must be >= 0";
+  ( {
+      st with
+      st_limit = Some per_page;
+      st_offset = Some ((page - 1) * per_page);
+    },
+    () )
+
 let for_update ?(nowait = false) ?(skip_locked = false) () st =
   if nowait && skip_locked then
     invalid_arg "Qb.Query.for_update: choose at most one of nowait, skip_locked";
@@ -584,51 +604,76 @@ let select (Proj (ct, dec, items)) st =
   if items = [] then invalid_arg "Qb.Query.select: no columns";
   let select_items = List.map (fun f -> (None, f)) items in
   let plan = make_plan st select_items in
-  (st, Query (ct, dec, Simple plan, Multi))
+  (st, Query (ct, dec, Simple plan, Multi, None))
 
 let select_one e st =
   let ty = Expr.ty_of e in
   let plan = make_plan st [ (None, fun o -> Expr.render o e) ] in
-  (st, Query (ty.caqti, Fun.id, Simple plan, Single ty))
+  (st, Query (ty.caqti, Fun.id, Simple plan, Single ty, None))
 
-let build b = Stdlib.snd (b empty_state)
+let select1 = select_one
+
+let select2 a b =
+  select
+    (let+ x = expr a and+ y = expr b in
+     (x, y))
+
+let select3 a b c =
+  select
+    (let+ x = expr a and+ y = expr b and+ z = expr c in
+     (x, y, z))
+
+let select4 a b c d =
+  select
+    (let+ w = expr a and+ x = expr b and+ y = expr c and+ z = expr d in
+     (w, x, y, z))
+
+let named qname (Query (ct, dec, body, sty, _)) =
+  Query (ct, dec, body, sty, Some qname)
+
+let query_name (Query (_, _, _, _, n)) = n
+
+let build ?name:qname b =
+  let q = Stdlib.snd (b empty_state) in
+  match qname with None -> q | Some n -> named n q
 
 let sub b =
   let st, () = b empty_state in
   let plan = make_plan st [ (None, fun o -> str o "1") ] in
-  Query (Caqti_type.unit, Fun.id, Simple plan, Multi)
+  Query (Caqti_type.unit, Fun.id, Simple plan, Multi, None)
 
 (* Compound queries *)
 
-let combine op (Query (ct, dec, left, sty)) (Query (_, _, right, _)) =
+let combine op (Query (ct, dec, left, sty, n)) (Query (_, _, right, _, _)) =
   Query
     ( ct,
       dec,
       Compound { op; left; right; order_by = []; limit = None; offset = None },
-      sty )
+      sty,
+      n )
 
 let union a b = combine Union a b
 let union_all a b = combine Union_all a b
 let intersect a b = combine Intersect a b
 let except a b = combine Except a b
 
-let with_limit n (Query (ct, dec, body, sty)) =
+let with_limit n (Query (ct, dec, body, sty, qn)) =
   if n < 0 then invalid_arg "Qb.Query.with_limit: negative limit";
   let body =
     match body with
     | Simple p -> Simple { p with limit = Some n }
     | Compound c -> Compound { c with limit = Some n }
   in
-  Query (ct, dec, body, sty)
+  Query (ct, dec, body, sty, qn)
 
-let with_offset n (Query (ct, dec, body, sty)) =
+let with_offset n (Query (ct, dec, body, sty, qn)) =
   if n < 0 then invalid_arg "Qb.Query.with_offset: negative offset";
   let body =
     match body with
     | Simple p -> Simple { p with offset = Some n }
     | Compound c -> Compound { c with offset = Some n }
   in
-  Query (ct, dec, body, sty)
+  Query (ct, dec, body, sty, qn)
 
 (* ---------- SQL rendering ---------- *)
 
@@ -791,13 +836,13 @@ let rec render_body ?(nested = false) o = function
 
 (* ---------- subquery expressions ---------- *)
 
-let exists (Query (_, _, body, _)) =
+let exists (Query (_, _, body, _, _)) =
   Expr.sub Ty.bool (fun o ->
       str o "EXISTS (";
       render_body o body;
       str o ")")
 
-let not_exists (Query (_, _, body, _)) =
+let not_exists (Query (_, _, body, _, _)) =
   Expr.sub Ty.bool (fun o ->
       str o "NOT EXISTS (";
       render_body o body;
@@ -809,7 +854,7 @@ let single_ty_of fn = function
       invalid_arg
         (fn ^ ": subquery must select a single column (use Qb.Query.select_one)")
 
-let in_query e (Query (_, _, body, sty)) =
+let in_query e (Query (_, _, body, sty, _)) =
   ignore (single_ty_of "Qb.Query.in_query" sty);
   Expr.sub Ty.bool (fun o ->
       Expr.render o e;
@@ -817,7 +862,7 @@ let in_query e (Query (_, _, body, sty)) =
       render_body o body;
       str o ")")
 
-let not_in_query e (Query (_, _, body, sty)) =
+let not_in_query e (Query (_, _, body, sty, _)) =
   ignore (single_ty_of "Qb.Query.not_in_query" sty);
   Expr.sub Ty.bool (fun o ->
       Expr.render o e;
@@ -825,21 +870,21 @@ let not_in_query e (Query (_, _, body, sty)) =
       render_body o body;
       str o ")")
 
-let scalar (Query (_, _, body, sty)) =
+let scalar (Query (_, _, body, sty, _)) =
   let ty = single_ty_of "Qb.Query.scalar" sty in
   Expr.sub (Ty.nullable ty) (fun o ->
       str o "(";
       render_body o body;
       str o ")")
 
-let scalar_opt (Query (_, _, body, sty)) =
+let scalar_opt (Query (_, _, body, sty, _)) =
   let ty = single_ty_of "Qb.Query.scalar_opt" sty in
   Expr.sub ty (fun o ->
       str o "(";
       render_body o body;
       str o ")")
 
-(* ---------- preparing and rendering SELECT / COUNT ---------- *)
+(* ---------- preparing and rendering SELECT / COUNT / EXISTS ---------- *)
 
 type 'a prepared =
   | Prepared : 'x Caqti_type.t * ('x -> 'a) * (out -> unit) -> 'a prepared
@@ -860,7 +905,7 @@ let apply_limit limit body =
           in
           Compound { c with limit })
 
-let prepare ?limit (Query (ct, dec, body, _)) =
+let prepare ?limit (Query (ct, dec, body, _, _)) =
   let body = apply_limit limit body in
   Prepared (ct, dec, fun o -> render_body o body)
 
@@ -869,33 +914,40 @@ let to_sql ?(dialect = Postgres) q =
   (match prepare q with Prepared (_, _, render) -> render o);
   Buffer.contents o.buf
 
-let render_count o (Query (_, _, body, _)) =
+let debug ?(dialect = Postgres) q =
+  let o = out dialect in
+  (match prepare q with Prepared (_, _, render) -> render o);
+  let sql, params, _ = Cache.finish o in
+  let prefix =
+    match query_name q with Some n -> "[" ^ n ^ "] " | None -> ""
+  in
+  Format.asprintf "%s%s%a" prefix sql Cache.pp_params params
+
+let rec strip_locks = function
+  | Simple p -> Simple { p with lock = None }
+  | Compound c ->
+      Compound { c with left = strip_locks c.left; right = strip_locks c.right }
+
+let strip_tail = function
+  | Simple p ->
+      Simple { p with order_by = []; limit = None; offset = None; lock = None }
+  | Compound c ->
+      Compound
+        {
+          c with
+          left = strip_locks c.left;
+          right = strip_locks c.right;
+          order_by = [];
+          limit = None;
+          offset = None;
+        }
+
+let render_count o (Query (_, _, body, _, _)) =
   match body with
   | Simple plan
     when (not plan.distinct) && plan.distinct_on = [] && plan.group_by = [] ->
       render_plan ~for_count:true o plan
   | _ ->
-      let rec strip_locks = function
-        | Simple p -> Simple { p with lock = None }
-        | Compound c ->
-            Compound
-              { c with left = strip_locks c.left; right = strip_locks c.right }
-      in
-      let strip_tail = function
-        | Simple p ->
-            Simple
-              { p with order_by = []; limit = None; offset = None; lock = None }
-        | Compound c ->
-            Compound
-              {
-                c with
-                left = strip_locks c.left;
-                right = strip_locks c.right;
-                order_by = [];
-                limit = None;
-                offset = None;
-              }
-      in
       str o "SELECT COUNT(*) FROM (";
       render_body o (strip_tail body);
       str o ") AS ";
@@ -906,11 +958,33 @@ let count_sql ?(dialect = Postgres) q =
   render_count o q;
   Buffer.contents o.buf
 
+let render_exists o (Query (_, _, body, _, _)) =
+  let inner =
+    match body with
+    | Simple p -> Simple { p with order_by = []; lock = None }
+    | Compound c ->
+        Compound
+          {
+            c with
+            left = strip_locks c.left;
+            right = strip_locks c.right;
+            order_by = [];
+          }
+  in
+  str o "SELECT EXISTS (";
+  render_body o inner;
+  str o ")"
+
+let exists_sql ?(dialect = Postgres) q =
+  let o = out dialect in
+  render_exists o q;
+  Buffer.contents o.buf
+
 (* ---------- multi-table writes ---------- *)
 
 (* INSERT INTO target (cols) SELECT ... *)
 
-let render_insert_select o target target_sel (Query (_, _, body, _)) =
+let render_insert_select o target target_sel (Query (_, _, body, _, _)) =
   base "Qb.Query.insert_select" target;
   check_nonempty "Qb.Query.insert_select" target_sel;
   match decoder target_sel with
@@ -1099,3 +1173,5 @@ let delete_using_returning_sql ?(dialect = Postgres) d returning =
   render_delete_using o d;
   render_returning_sel o d.del_id returning;
   Buffer.contents o.buf
+
+let name = query_name

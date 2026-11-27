@@ -192,10 +192,21 @@ let values_fn b cols =
 
 let table_cols (t : table) =
   let fields = uniq (List.map (fun (c : column) -> ident c.name) t.columns) in
-  (* Column values live next to [table], [values], [by_pk], [cols] and
-     [opt_cols], so a field with one of those names gets a column value called
-     e.g. [table_col]. *)
-  let reserved = [ "table"; "values"; "by_pk"; "cols"; "opt_cols" ] in
+  (* Column values live next to [table], [values], [by_pk], [cols], [opt_cols],
+     [from], [join] and [left_join], so a field with one of those names gets a
+     column value called e.g. [table_col]. *)
+  let reserved =
+    [
+      "table";
+      "values";
+      "by_pk";
+      "cols";
+      "opt_cols";
+      "from";
+      "join";
+      "left_join";
+    ]
+  in
   let values =
     uniq ~taken:reserved
       (List.map (fun f -> if List.mem f reserved then f ^ "_col" else f) fields)
@@ -283,21 +294,40 @@ let table_module ~bigint ~module_name:m (t : table) =
           pk_cols;
         p "\n")
   | [] -> ());
-  (* Scoped column accessors for [Qb.Query]: [let u' = Users.cols u] lets you
-     write [u'#name] instead of [u.@(Users.name)], and [opt_cols] automatically
-     flattens nullable columns on outer joins without [option option]. *)
+  (* Scoped column accessors for [Qb.Query]: [let* u = Users.from] or
+     [let u' = Users.cols u] lets you write [u#name], [u#ref], [u#whole], and
+     [opt_cols] automatically flattens nullable columns on outer joins without
+     [option option]. *)
+  let field_names = List.map (fun (_, (f, _)) -> f) cols in
   p "\n  let cols (r : t Qb.Query.ref) =\n    object\n";
+  if not (List.mem "ref" field_names) then p "      method ref = r\n";
+  if not (List.mem "whole" field_names) then
+    p "      method whole = Qb.Query.whole r\n";
   List.iter
-    (fun (_, (f, v)) -> p "      method %s = Qb.Query.(r.@(%s))\n" f v)
+    (fun (_, (f, v)) -> p "      method %s = Qb.Query.( .@() ) r %s\n" f v)
     cols;
   p "    end\n";
   p "\n  let opt_cols (r : t Qb.Query.opt_ref) =\n    object\n";
+  if not (List.mem "ref" field_names) then p "      method ref = r\n";
+  if not (List.mem "whole" field_names) then
+    p "      method whole = Qb.Query.whole_opt r\n";
   List.iter
     (fun ((c : column), (f, v)) ->
-      let op = if c.not_null then ".@?" else ".@??" in
-      p "      method %s = Qb.Query.(r%s(%s))\n" f op v)
+      let op = if c.not_null then ".@?()" else ".@??()" in
+      p "      method %s = Qb.Query.( %s ) r %s\n" f op v)
     cols;
   p "    end\n";
+  p "\n  let from = Qb.Query.map_build cols (Qb.Query.from table)\n";
+  p
+    "\n\
+    \  let join ~on =\n\
+    \    Qb.Query.map_build cols (Qb.Query.join table ~on:(fun r -> on (cols \
+     r)))\n";
+  p
+    "\n\
+    \  let left_join ~on =\n\
+    \    Qb.Query.map_build opt_cols\n\
+    \      (Qb.Query.left_join table ~on:(fun r -> on (cols r)))\n";
   p "end\n";
   Buffer.contents b
 

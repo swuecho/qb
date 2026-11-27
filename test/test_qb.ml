@@ -2404,7 +2404,63 @@ let test_multi_db db =
          select (expr (Expr.Json.get_text t.@(Things.doc) (Expr.text "role")))))
     |> Blocking.query_one db |> ok
   in
-  Alcotest.(check (option string)) "json get_text" (Some "admin") role
+  Alcotest.(check (option string)) "json get_text" (Some "admin") role;
+
+  (* 12. Qb.Q one-stop DSL: value ops (=., >=., =?.), &>, select1..4, paginate,
+     debug, named, and query_exists *)
+  let dsl_q =
+    Q.(
+      build ~name:"adult_emails"
+        (let* u = from Users.table in
+         where (u.@(Users.age) >=. 18 && u.@(Users.email) =?. "ann@x.org")
+         &> order_by [ asc u.@(Users.id) ]
+         &> paginate ~page:1 ~per_page:10
+         &> select2 u.@(Users.name) u.@(Users.age)))
+  in
+  Alcotest.(check (option string))
+    "query name" (Some "adult_emails") (Q.name dsl_q);
+  Alcotest.(check string)
+    "query debug shows name and bound params"
+    {|[adult_emails] SELECT "t0"."name", "t0"."age" FROM "users" AS "t0" WHERE ("t0"."age" >= ? AND "t0"."email" = ?) ORDER BY "t0"."id" ASC LIMIT 10 OFFSET 0 [18, "ann@x.org"]|}
+    (Q.debug ~dialect:Postgres dsl_q);
+  Alcotest.(check (list (pair string int)))
+    "Qb.Q query_all"
+    [ ("Ann", 50) ]
+    (ok (Blocking.query_all db dsl_q));
+  Alcotest.(check bool)
+    "query_exists true" true
+    (ok (Blocking.query_exists db dsl_q));
+  let missing_q =
+    Q.(
+      build
+        (let* u = from Users.table in
+         where (u.@(Users.name) =. "Nobody") &> select1 u.@(Users.id)))
+  in
+  Alcotest.(check bool)
+    "query_exists false" false
+    (ok (Blocking.query_exists db missing_q));
+  let page2 =
+    Q.(
+      build
+        (let* u = from Users.table in
+         order_by [ asc u.@(Users.id) ]
+         &> paginate ~page:2 ~per_page:2
+         &> select1 u.@(Users.name)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list string)) "paginate page 2" [ "Cy" ] page2;
+  (* =. None renders IS NULL *)
+  let null_email_names =
+    Q.(
+      build
+        (let* u = from Users.table in
+         where (u.@(Users.email) =. None)
+         &> order_by [ asc u.@(Users.id) ]
+         &> select1 u.@(Users.name)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list string))
+    "=. None matches NULL" [ "Bob"; "Cy" ] null_email_names
 
 let test_relations_db db =
   ok

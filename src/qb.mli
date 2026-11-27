@@ -368,6 +368,27 @@ module Expr : sig
     val ( >=? ) : 'a option t -> 'a t -> bool t
     val ( <? ) : 'a option t -> 'a t -> bool t
     val ( <=? ) : 'a option t -> 'a t -> bool t
+
+    (** Compare an expression directly against a plain OCaml value (bound as a
+        parameter using the expression's own type, no [Expr.int]/[Expr.text]
+        wrapper needed). [e =. None] renders [IS NULL]. *)
+
+    val ( =. ) : 'a t -> 'a -> bool t
+    val ( <>. ) : 'a t -> 'a -> bool t
+    val ( >. ) : 'a t -> 'a -> bool t
+    val ( >=. ) : 'a t -> 'a -> bool t
+    val ( <. ) : 'a t -> 'a -> bool t
+    val ( <=. ) : 'a t -> 'a -> bool t
+
+    (** Compare a nullable expression directly against a plain non-null OCaml
+        value: [u.@(Users.email) =?. "ann@x.org"]. *)
+
+    val ( =?. ) : 'a option t -> 'a -> bool t
+    val ( <>?. ) : 'a option t -> 'a -> bool t
+    val ( >?. ) : 'a option t -> 'a -> bool t
+    val ( >=?. ) : 'a option t -> 'a -> bool t
+    val ( <?. ) : 'a option t -> 'a -> bool t
+    val ( <=?. ) : 'a option t -> 'a -> bool t
     val ( && ) : bool t -> bool t -> bool t
     val ( || ) : bool t -> bool t -> bool t
     val not : bool t -> bool t
@@ -988,6 +1009,15 @@ module Query : sig
 
   val return : 'a -> 'a build
   val ( let* ) : 'a build -> ('a -> 'b build) -> 'b build
+
+  val ( &> ) : unit build -> 'a build -> 'a build
+  (** Sequence clauses without [let* () = ... in] boilerplate:
+      [where cond &> order_by [...] &> limit 20 &> select2 a b]. *)
+
+  val map_build : ('a -> 'b) -> 'a build -> 'b build
+  (** Transforms the handle produced by a build step, e.g.
+      [left_join_many a#ref rel |> map_build Articles.opt_cols]. *)
+
   val from : 'r table -> 'r ref build
   val join : 'r table -> on:('r ref -> bool Expr.t) -> 'r ref build
   val left_join : 'r table -> on:('r ref -> bool Expr.t) -> 'r opt_ref build
@@ -1095,6 +1125,12 @@ module Query : sig
   val order_by : order list -> unit build
   val limit : int -> unit build
   val offset : int -> unit build
+
+  val paginate : page:int -> per_page:int -> unit build
+  (** 1-indexed pagination: sets
+      [LIMIT per_page OFFSET ((page - 1) * per_page)]. Raises [Invalid_argument]
+      if [page < 1] or [per_page < 0]. *)
+
   val for_update : ?nowait:bool -> ?skip_locked:bool -> unit -> unit build
   val for_share : ?nowait:bool -> ?skip_locked:bool -> unit -> unit build
   val select : 'a proj -> 'a t build
@@ -1103,7 +1139,27 @@ module Query : sig
   (** Selects a single expression; required for {!in_query}, {!not_in_query},
       and {!scalar} subqueries. *)
 
-  val build : 'a t build -> 'a t
+  val select1 : 'a Expr.t -> 'a t build
+  (** Alias for {!select_one}. *)
+
+  val select2 : 'a Expr.t -> 'b Expr.t -> ('a * 'b) t build
+  val select3 : 'a Expr.t -> 'b Expr.t -> 'c Expr.t -> ('a * 'b * 'c) t build
+
+  val select4 :
+    'a Expr.t ->
+    'b Expr.t ->
+    'c Expr.t ->
+    'd Expr.t ->
+    ('a * 'b * 'c * 'd) t build
+
+  val build : ?name:string -> 'a t build -> 'a t
+  (** Finalizes a query. When [?name] is given, [Qb.src] debug logs and {!debug}
+      prefix the statement with [[name]]. *)
+
+  val named : string -> 'a t -> 'a t
+  (** Names a query for {!name}, {!debug}, and [Qb.src] logs. *)
+
+  val name : _ t -> string option
 
   val sub : unit build -> unit t
   (** Shorthand [SELECT 1 FROM ...] subquery for {!exists} / {!not_exists}. *)
@@ -1151,7 +1207,14 @@ module Query : sig
   (** {2 SQL rendering} *)
 
   val to_sql : ?dialect:dialect -> _ t -> string
+
+  val debug : ?dialect:dialect -> _ t -> string
+  (** The rendered SQL together with its formatted bound parameters (and
+      [[name]] prefix if named), for quick inspection without configuring
+      [Logs]. *)
+
   val count_sql : ?dialect:dialect -> _ t -> string
+  val exists_sql : ?dialect:dialect -> _ t -> string
 
   val insert_select_sql :
     ?dialect:dialect -> 'r table -> ('r, 'a) sel -> 'a t -> string
@@ -1165,6 +1228,150 @@ module Query : sig
 
   val delete_using_returning_sql :
     ?dialect:dialect -> 'r delete_plan -> ('r, _) sel -> string
+end
+
+(** One-stop local-open DSL for multi-table queries: combines {!Query},
+    {!Expr.Ops} (including [=.]/[>=.] value comparisons), and {!Expr} functions
+    so queries need only one [Qb.Q.( ... )] open.
+
+    {[
+    Qb.Q.(
+      build ~name:"active_comments"
+        (let* u = from Users.table in
+         let* c =
+           left_join Comments.table ~on:(fun c ->
+               c.@(Comments.author_id) = u.@(Users.id))
+         in
+         where (u.@(Users.age) >=. 18 && u.@(Users.name) <>. "Bob")
+         &> order_by [ desc c.@?(Comments.id) ]
+         &> paginate ~page:1 ~per_page:20
+         &> select2 u.@(Users.name) c.@?(Comments.body)))
+    ]} *)
+module Q : sig
+  include
+    module type of Query
+      with type 'a t = 'a Query.t
+       and type 'r ref = 'r Query.ref
+       and type 'r opt_ref = 'r Query.opt_ref
+       and type 's cte = 's Query.cte
+       and type 'a proj = 'a Query.proj
+       and type ('s, 'a) named = ('s, 'a) Query.named
+       and type ('s, 'e) sub_query = ('s, 'e) Query.sub_query
+       and type 'a build = 'a Query.build
+       and type 'r update_assign = 'r Query.update_assign
+       and type 'r update_plan = 'r Query.update_plan
+       and type 'r delete_plan = 'r Query.delete_plan
+
+  include module type of Expr.Ops
+
+  val any : _ Expr.t -> Expr.any
+  val lit : 'a ty -> 'a -> 'a Expr.t
+  val int : int -> int Expr.t
+  val int64 : int64 -> int64 Expr.t
+  val float : float -> float Expr.t
+  val text : string -> string Expr.t
+  val bool : bool -> bool Expr.t
+  val ptime : Ptime.t -> Ptime.t Expr.t
+  val date : Ptime.t -> Ptime.t Expr.t
+  val uuid : string -> string Expr.t
+  val json : string -> string Expr.t
+  val null : 'a ty -> 'a option Expr.t
+  val some : 'a Expr.t -> 'a option Expr.t
+  val lower : string Expr.t -> string Expr.t
+  val upper : string Expr.t -> string Expr.t
+  val trim : string Expr.t -> string Expr.t
+  val length : string Expr.t -> int Expr.t
+  val concat : string Expr.t -> string Expr.t -> string Expr.t
+  val coalesce : 'a option Expr.t -> 'a Expr.t -> 'a Expr.t
+  val coalesce_opt : 'a option Expr.t -> 'a option Expr.t -> 'a option Expr.t
+  val nullif : 'a Expr.t -> 'a Expr.t -> 'a option Expr.t
+  val case_when : (bool Expr.t * 'a Expr.t) list -> else_:'a Expr.t -> 'a Expr.t
+  val case_when_opt : (bool Expr.t * 'a Expr.t) list -> 'a option Expr.t
+  val now : unit -> Ptime.t Expr.t
+  val cast : 'b ty -> _ Expr.t -> 'b Expr.t
+  val count_all : int Expr.t
+  val count : _ Expr.t -> int Expr.t
+  val count_distinct : _ Expr.t -> int Expr.t
+  val sum_int : int Expr.t -> int option Expr.t
+  val sum_int64 : int64 Expr.t -> int64 option Expr.t
+  val sum_float : float Expr.t -> float option Expr.t
+  val avg : _ Expr.t -> float option Expr.t
+  val min : 'a Expr.t -> 'a option Expr.t
+  val max : 'a Expr.t -> 'a option Expr.t
+  val min_opt : 'a option Expr.t -> 'a option Expr.t
+  val max_opt : 'a option Expr.t -> 'a option Expr.t
+  val filter : bool Expr.t -> 'a Expr.t -> 'a Expr.t
+
+  val over :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a Expr.t
+
+  val row_number :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    unit ->
+    int Expr.t
+
+  val rank :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    unit ->
+    int Expr.t
+
+  val dense_rank :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    unit ->
+    int Expr.t
+
+  val lag :
+    ?offset:int ->
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a option Expr.t
+
+  val lag_default :
+    ?offset:int ->
+    default:'a Expr.t ->
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a Expr.t
+
+  val lead :
+    ?offset:int ->
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a option Expr.t
+
+  val lead_default :
+    ?offset:int ->
+    default:'a Expr.t ->
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a Expr.t
+
+  val first_value :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a option Expr.t
+
+  val last_value :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a option Expr.t
+
+  module Keyset = Expr.Keyset
+  module Json = Expr.Json
+  module Pg = Expr.Pg
+  module Raw = Raw
 end
 
 (** {1 Statements written as SQL}
@@ -1705,6 +1912,10 @@ module type S = sig
 
   val query_count :
     db -> _ Query.t -> (int, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val query_exists :
+    db -> _ Query.t -> (bool, [> Caqti_error.call_or_retrieve ]) result fiber
+  (** Runs [SELECT EXISTS (...)] to check whether at least one row matches. *)
 
   val insert_select :
     db ->

@@ -289,6 +289,12 @@ let qb_statements dialect =
              let* () = group_by [ Expr.any u.@(Users.name) ] in
              let* () = for_update ~skip_locked:true () in
              select (expr u.@(Users.name)))) );
+    ( "query exists",
+      Q.exists_sql ~dialect
+        Q.(
+          build
+            (let* u = from Users.table in
+             where (u.@(Users.age) >=. 18) &> select1 u.@(Users.id))) );
     ( "right_join and full_join",
       Query.to_sql ~dialect
         Query.(
@@ -677,28 +683,51 @@ let generated_relations_on_sqlite () =
        loaded);
   let joined =
     get
-      (Qb.Query.(
-         build
-           (let* a = from Accounts.table in
-            let* art = left_join_many a Relations.accounts_articles in
-            let a' = Accounts.cols a and art' = Articles.opt_cols art in
-            let* () = order_by [ asc a'#id; nulls_last (asc art'#title) ] in
-            select
-              (let+ email = expr a'#email
-               and+ title = expr art'#title
-               and+ rating = expr art'#rating in
-               (email, title, rating))))
+      (Qb.Q.(
+         build ~name:"acct_articles"
+           (let* a = Accounts.from in
+            let* art =
+              Articles.left_join ~on:(fun art -> art#account_id = a#id)
+            in
+            where (a#active =. true)
+            &> order_by [ asc a#id; nulls_last (asc art#title) ]
+            &> select3 a#email art#title art#rating))
       |> Qb.Blocking.query_all db)
   in
   Alcotest.(
     check (list (pair string (pair (option string) (option (float 0.01))))))
-    "generated cols/opt_cols + relation left_join_many"
+    "generated from/left_join + Qb.Q"
     [
       ("ann@example.com", (Some "First", None));
       ("ann@example.com", (Some "Second", None));
       ("bo@example.com", (None, None));
     ]
     (List.map (fun (e, t, r) -> (e, (t, r))) joined);
+  (* Also verify #ref + #whole with map_build + left_join_many *)
+  let whole_joined =
+    get
+      (Qb.Q.(
+         build
+           (let* a = Accounts.from in
+            let* art =
+              left_join_many a#ref Relations.accounts_articles
+              |> map_build Articles.opt_cols
+            in
+            order_by [ asc a#id; nulls_last (asc art#title) ]
+            &> select
+                 (let+ acct = a#whole and+ art = art#whole in
+                  ( acct.Accounts.email,
+                    Option.map (fun (x : Articles.t) -> x.title) art ))))
+      |> Qb.Blocking.query_all db)
+  in
+  Alcotest.(check (list (pair string (option string))))
+    "generated #ref + #whole + map_build"
+    [
+      ("ann@example.com", Some "First");
+      ("ann@example.com", Some "Second");
+      ("bo@example.com", None);
+    ]
+    whole_joined;
   let articles =
     get
       (Qb.(from Articles.table |> order_by [ asc Articles.title ])

@@ -165,6 +165,9 @@ module type S = sig
   val query_count :
     db -> _ Multi.t -> (int, [> Caqti_error.call_or_retrieve ]) result fiber
 
+  val query_exists :
+    db -> _ Multi.t -> (bool, [> Caqti_error.call_or_retrieve ]) result fiber
+
   val insert_select :
     db ->
     'r table ->
@@ -618,40 +621,56 @@ struct
         counted ?name:s.name db ~oneshot:(variadic s) sql ps pt pv
 
   let query_all db q =
+    let name = Multi.name q in
     match Multi.prepare q with
     | Multi.Prepared (rt, decode, render) -> (
         let o = out_for db in
         render o;
         match Cache.finish o with
         | sql, ps, Pack (pt, pv) ->
-            collect_list db ~oneshot:o.variadic sql ps pt pv rt decode)
+            collect_list ?name db ~oneshot:o.variadic sql ps pt pv rt decode)
 
   let query_first db q =
+    let name = Multi.name q in
     match Multi.prepare ~limit:1 q with
     | Multi.Prepared (rt, decode, render) -> (
         let o = out_for db in
         render o;
         match Cache.finish o with
         | sql, ps, Pack (pt, pv) ->
-            find_opt db ~oneshot:o.variadic sql ps pt pv rt decode)
+            find_opt ?name db ~oneshot:o.variadic sql ps pt pv rt decode)
 
   let query_one db q =
+    let name = Multi.name q in
     match Multi.prepare q with
     | Multi.Prepared (rt, decode, render) -> (
         let o = out_for db in
         render o;
         match Cache.finish o with
         | sql, ps, Pack (pt, pv) ->
-            find db ~oneshot:o.variadic sql ps pt pv rt decode)
+            find ?name db ~oneshot:o.variadic sql ps pt pv rt decode)
 
   let query_count ((module Db : B.CONNECTION) as db) q =
+    let name = Multi.name q in
     let o = out_for db in
     Multi.render_count o q;
     match Cache.finish o with
     | sql, ps, Pack (pt, pv) ->
-        logged sql ps string_of_int (fun () ->
+        logged ?name sql ps string_of_int (fun () ->
             Db.find
               (Cache.request ~oneshot:o.variadic Cache.one pt Caqti_type.int sql)
+              pv)
+
+  let query_exists ((module Db : B.CONNECTION) as db) q =
+    let name = Multi.name q in
+    let o = out_for db in
+    Multi.render_exists o q;
+    match Cache.finish o with
+    | sql, ps, Pack (pt, pv) ->
+        logged ?name sql ps string_of_bool (fun () ->
+            Db.find
+              (Cache.request ~oneshot:o.variadic Cache.one pt Caqti_type.bool
+                 sql)
               pv)
 
   let insert_select db target target_sel q =

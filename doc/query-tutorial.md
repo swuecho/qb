@@ -327,32 +327,33 @@ let* updated =
 
 ---
 
-## 9. Even less boilerplate with `qb-pg-parse gen`
+## 9. Even less boilerplate with `Qb.Q` and `qb-pg-parse gen`
 
-If you generate your table modules from SQL migrations (`qb-pg-parse gen migrations -o schema.ml`),
-`qb` generates both **`Relations`** (from `REFERENCES` constraints) and scoped
-**`cols` / `opt_cols`** accessors automatically:
+`Qb.Q` combines `Qb.Query`, `Qb.Expr.Ops` (including `=.`/`>=.` value
+comparisons), `Qb.Expr` functions, `&>` clause sequencing, and
+`select1`–`select4` into one local open. Paired with `qb-pg-parse gen`
+(`from`, `join`, `left_join`, `#ref`, `#whole`, and `Relations`):
 
 ```ocaml
 open Schema
 
 let account_articles db =
-  Qb.Query.(
-    build
-      (let* a = from Accounts.table in
-       let* art = left_join_many a Relations.accounts_articles in
-       let a' = Accounts.cols a and art' = Articles.opt_cols art in
-       let* () = order_by [ asc a'#id; nulls_last (asc art'#title) ] in
-       select
-         (let+ email = expr a'#email
-          and+ title = expr art'#title
-          and+ rating = expr art'#rating in
-          (email, title, rating))))
+  Qb.Q.(
+    build ~name:"account_articles"
+      (let* a = Accounts.from in
+       let* art =
+         Articles.left_join ~on:(fun art -> art#account_id = a#id)
+       in
+       where (a#active =. true)
+       &> order_by [ asc a#id; nulls_last (asc art#title) ]
+       &> paginate ~page:1 ~per_page:20
+       &> select3 a#email art#title art#rating))
   |> Qb.Blocking.query_all db
 ```
 
-With `opt_cols`, nullable columns on outer joins stay `'a option` automatically
-— you never have to remember `.@?()` vs. `.@??()`.
+With `Articles.left_join`, nullable columns on outer joins stay `'a option`
+automatically—you never have to remember `.@?()` vs. `.@??()`, and
+`Qb.Q.debug q` prints the SQL alongside its formatted bound parameters.
 
 ---
 

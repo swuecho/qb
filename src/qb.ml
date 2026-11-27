@@ -8,6 +8,7 @@ module Raw = Expr.Raw
 module Rel = Rel
 include Query
 module Query = Multi
+module Q = Q
 
 type 'a stmt = 'a Stmt.stmt
 

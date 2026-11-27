@@ -101,30 +101,27 @@ let ann = Qb.Blocking.insert_values db Qb.(values Users.table Ops.[ Users.name :
   and checks that the database matches what your queries were compiled
   against. See below.
 
-## Multi-table queries & relations: `Qb.Query`, `Qb.Expr`, `Qb.Rel`
+## Multi-table queries & relations: `Qb.Q`, `Qb.Query`, `Qb.Expr`, `Qb.Rel`
 
 When a query spans several tables, aggregates, subqueries, CTEs, or dynamic
-filters across joins, use `Qb.Query` with scoped table handles (`let*`):
+filters across joins, open `Qb.Q` (which combines `Qb.Query`, `Qb.Expr.Ops`,
+value comparisons like `=.`/`>=.`, `&>`, and `select1`–`select4`):
 
 ```ocaml
 let thread db =
-  Qb.Query.(
-    build
+  Qb.Q.(
+    build ~name:"comment_thread"
       (let* c = from Comments.table in
        let* author =
-         join Users.table ~on:(fun u ->
-             Qb.Expr.Ops.(u.@(Users.id) = c.@(Comments.author_id)))
+         join Users.table ~on:(fun u -> u.@(Users.id) = c.@(Comments.author_id))
        in
        let* parent =
          left_join Comments.table ~on:(fun p ->
-             Qb.Expr.Ops.(c.@(Comments.reply_to) =? p.@(Comments.id)))
+             c.@(Comments.reply_to) =? p.@(Comments.id))
        in
-       let* () = order_by [ asc c.@(Comments.id) ] in
-       select
-         (let+ body = expr c.@(Comments.body)
-          and+ author_name = expr author.@(Users.name)
-          and+ parent_body = expr parent.@?(Comments.body) in
-          (body, author_name, parent_body))))
+       where (author.@(Users.age) >=. 18)
+       &> order_by [ asc c.@(Comments.id) ]
+       &> select3 c.@(Comments.body) author.@(Users.name) parent.@?(Comments.body)))
   |> Qb.Blocking.query_all db
 ```
 

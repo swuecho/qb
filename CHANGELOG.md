@@ -18,7 +18,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `insert_many`, `insert_many_values`, single-table upserts (`On_conflict`,
   `upsert`, `upsert_many`), deduplicated column assignments, `Stmt` placeholder
   validation, and a two-table join.
-- **`qb` multi-table builder**: `Qb.Expr` (typed SQL expressions, scalar
+- **`qb` multi-table builder**: `Qb.Q` (one-stop local-open DSL combining
+  `Qb.Query`, `Qb.Expr.Ops`, value comparisons `=.`/`>=.`/`=?.`, `&>` clause
+  sequencing, `select1`–`select4`, `paginate`, `debug`, `named`, and
+  `query_exists`), `Qb.Expr` (typed SQL expressions, scalar
   functions, aggregates with `FILTER (WHERE ...)`, window functions
   `row_number`/`rank`/`dense_rank`/`lag`/`lead`/`first_value`/`last_value`/`over`,
   `Expr.Keyset` tuple comparisons for cursor pagination, `Expr.Json` /
@@ -41,9 +44,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   while parsing) to check SQL, replay migrations into a schema (including
   `FOREIGN KEY` constraints across `CREATE`, `ALTER`, `RENAME`, and `DROP`),
   generate qb table modules (including `by_pk` for both single and composite
-  primary keys, scoped `cols` / `opt_cols` accessors for `Qb.Query`, and a
-  `Relations` module of typed `Qb.Rel` descriptors including auto-detected
-  `many_to_many` join tables),
+  primary keys, scoped `from`/`join`/`left_join` and `cols`/`opt_cols` with
+  `#ref`/`#whole`, and a `Relations` module of typed `Qb.Rel` descriptors
+  including auto-detected `many_to_many` join tables),
   and type SQL queries (including simple/searched `CASE`, `NULLIF`,
   `GREATEST`/`LEAST`, and boolean parameter inference). `gen`, `queries`, and
   `check` accept directories as well as individual `.sql` files, and `init`

@@ -866,28 +866,36 @@ also generates both `Qb.Rel.many_to_many` directions (`posts_tags` and
 When you generate your schema with `qb-pg-parse gen migrations -o schema.ml`,
 two multi-table helpers are emitted automatically:
 
-### 1. Scoped column accessors (`cols` / `opt_cols`)
+### 1. Scoped table handles (`from`, `join`, `left_join`, `cols` / `opt_cols`)
 
-Every generated table module gets `cols : t Qb.Query.ref -> < ... >` and
-`opt_cols : t Qb.Query.opt_ref -> < ... >`:
+Every generated table module gets `from`, `join ~on`, `left_join ~on`, and
+`cols` / `opt_cols` (exposing `#ref`, `#whole`, and one method per column):
 
 ```ocaml
 open Schema
 
 let account_articles db =
-  Qb.Query.(
-    build
-      (let* a = from Accounts.table in
-       let* art = left_join_many a Relations.accounts_articles in
-       let a' = Accounts.cols a and art' = Articles.opt_cols art in
-       let* () = order_by [ asc a'#id; nulls_last (asc art'#title) ] in
-       select
-         (let+ email = expr a'#email
-          and+ title = expr art'#title      (* string option *)
-          and+ rating = expr art'#rating    (* float option, never option option *)
-          in
-          (email, title, rating))))
+  Qb.Q.(
+    build ~name:"account_articles"
+      (let* a = Accounts.from in
+       let* art =
+         Articles.left_join ~on:(fun art -> art#account_id = a#id)
+       in
+       where (a#active =. true)
+       &> order_by [ asc a#id; nulls_last (asc art#title) ]
+       &> select3 a#email art#title art#rating))
   |> Qb.Blocking.query_all db
+```
+
+You can also compose relation joins directly with `map_build`:
+
+```ocaml
+let* a = Accounts.from in
+let* art =
+  left_join_many a#ref Relations.accounts_articles
+  |> map_build Articles.opt_cols
+in
+select (let+ acct = a#whole and+ art = art#whole in (acct, art))
 ```
 
 `opt_cols` inspects each column's `NOT NULL` status from your migrations and
