@@ -437,28 +437,14 @@ let rec expect env j (ty : pg_type) =
   in
   match node j with
   | Some ("ParamRef", pr) -> set_param env pr ty
-  | Some ("A_Expr", a)
-    when field "lexpr" a = None
-         && str "kind" a = Some "AEXPR_OP"
-         && List.mem (names (list "name" a)) [ [ "-" ]; [ "+" ] ] ->
-      Option.iter (fun x -> expect env x ty) (field "rexpr" a)
   | Some ("A_Expr", a) when ty.array_dims = 0 -> (
       match (arithmetic a, family ty) with
       | Some "||", "text" -> sides a
       | Some "||", _ -> ()
       | Some _, ("integer" | "float") -> sides a
       | _ -> ())
-  | Some ("CoalesceExpr", c) | Some ("MinMaxExpr", c) ->
+  | Some ("CoalesceExpr", c) ->
       List.iter (fun a -> expect env a ty) (list "args" c)
-  | Some ("CaseExpr", c) ->
-      List.iter
-        (fun w ->
-          match node w with
-          | Some ("CaseWhen", w) ->
-              Option.iter (fun r -> expect env r ty) (field "result" w)
-          | _ -> ())
-        (list "args" c);
-      Option.iter (fun r -> expect env r ty) (field "defresult" c)
   | Some ("FuncCall", f)
     when family ty = "text"
          && List.mem (func_name f)

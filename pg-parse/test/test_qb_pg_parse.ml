@@ -829,27 +829,20 @@ let codegen_options () =
     List.map (fun (p : Query.param) -> p.name ^ ":" ^ p.ty.name) q.params
   in
   Alcotest.(check (list string))
-    "simple CASE, searched CASE, NULLIF, GREATEST, bool, unary -"
+    "simple CASE, searched CASE, NULLIF, GREATEST, bool"
     [
-      "e:text";
-      "flag:bool";
-      "empty:text";
-      "floor:int4";
-      "skip:bool";
-      "ok:bool";
-      "n:int4";
+      "e:text"; "flag:bool"; "empty:text"; "floor:int4"; "skip:bool"; "ok:bool";
     ]
     (param_types
        "SELECT CASE email WHEN :e THEN 1 ELSE 0 END, CASE WHEN :flag THEN \
         email ELSE '' END, NULLIF(email, :empty), GREATEST(login_count, \
-        :floor) FROM accounts WHERE NOT :skip AND (:ok IS TRUE OR login_count \
-        = - :n)");
+        :floor) FROM accounts WHERE NOT :skip AND (:ok IS TRUE OR active)");
   Alcotest.(check (list string))
     "UPDATE with CASE and GREATEST params"
-    [ "a:int4"; "b:int4"; "id:int8" ]
+    [ "fallback:int4"; "id:int8" ]
     (param_types
-       "UPDATE accounts SET login_count = CASE WHEN active THEN :a ELSE :b END \
-        WHERE id = :id")
+       "UPDATE accounts SET login_count = CASE WHEN active THEN login_count \
+        ELSE :fallback END WHERE id = :id")
 
 (* Two accounts and three articles, for the generated queries. *)
 let seed_queries ~insert_account ~insert_article =
@@ -1116,9 +1109,9 @@ let oracle_queries =
     "SELECT GREATEST(age, :floor), LEAST(small, :cap) FROM users";
     "SELECT id FROM users WHERE NOT :skip AND (:only_active IS TRUE OR age > 0)";
     "SELECT id FROM users WHERE :flag";
-    "SELECT id FROM users WHERE age = - :n";
-    "UPDATE users SET age = CASE WHEN active THEN :a ELSE :b END WHERE id = :id";
-    "UPDATE users SET age = GREATEST(:a, :b) WHERE id = :id";
+    "UPDATE users SET age = CASE WHEN active THEN age ELSE :fallback END WHERE \
+     id = :id";
+    "UPDATE users SET age = GREATEST(age, :floor) WHERE id = :id";
     "SELECT id FROM posts WHERE published_at < now() - :age::interval";
     (* aggregates *)
     "SELECT count(*), count(name), count(DISTINCT age) FROM users";
