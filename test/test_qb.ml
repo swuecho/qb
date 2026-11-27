@@ -2883,8 +2883,12 @@ let test_pg_array_and_functions db =
   Alcotest.(check (list string))
     "Pg.any_array against bound TEXT[] param" [ "Ann"; "Cy" ] chosen_users;
   (* date_trunc + now + ILIKE + CHAR_LENGTH (multibyte UTF-8) *)
-  let ts = Ptime.of_float_s 1_700_000_025. |> Option.get in
-  let expected_min = Ptime.of_float_s 1_700_000_000. |> Option.get in
+  let ts =
+    Ptime.of_date_time ((2023, 11, 14), ((22, 13, 45), 0)) |> Option.get
+  in
+  let expected_min =
+    Ptime.of_date_time ((2023, 11, 14), ((22, 13, 0), 0)) |> Option.get
+  in
   ok
     (Blocking.insert db Things.table
        {
