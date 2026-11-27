@@ -48,11 +48,13 @@ fixed row type. In `Qb.Query`, every table you bring into `FROM` or a `JOIN`
 returns a **scoped handle**:
 
 - `'r Qb.Query.ref` — a **non-null** handle, returned by `from`, `join`,
-  `cross_join`, `from_cte`, `join_cte`, `from_subquery`, `join_subquery`,
-  `join_many`, and `join_one`.
+  `cross_join`, `right_join` (right side), `from_cte`, `join_cte`,
+  `from_subquery`, `join_subquery`, `join_many`, and `join_one`.
 - `'r Qb.Query.opt_ref` — a **nullable** handle, returned by `left_join`,
-  `right_join`, `full_join`, `left_join_cte`, `left_join_subquery`,
-  `left_join_many`, and `left_join_one`.
+  `right_join` (rebound left side), `full_join` (both sides), `left_join_cte`,
+  `left_join_subquery`, `left_join_many`, and `left_join_one`. Use `to_opt` to
+  downgrade any additional earlier left handles after a `right_join` or
+  `full_join`.
 
 You turn a table's column into a typed `'a Qb.Expr.t` by indexing the handle
 with OCaml's indexing operators:

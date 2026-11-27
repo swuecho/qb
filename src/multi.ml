@@ -256,13 +256,15 @@ let left_join table ~on st =
   let st, (id, _) = add_join Left table ~on st in
   (st, { orid = id; ortable = Some table })
 
-let right_join table ~on st =
-  let st, (id, _) = add_join Right table ~on st in
-  (st, { orid = id; ortable = Some table })
+let to_opt r = { orid = r.rid; ortable = r.rtable }
 
-let full_join table ~on st =
+let right_join left table ~on st =
+  let st, (_, r) = add_join Right table ~on st in
+  (st, (to_opt left, r))
+
+let full_join left table ~on st =
   let st, (id, _) = add_join Full table ~on st in
-  (st, { orid = id; ortable = Some table })
+  (st, (to_opt left, { orid = id; ortable = Some table }))
 
 let cross_join table st =
   base "Qb.Query.cross_join" table;
@@ -760,17 +762,24 @@ let rec render_body ?(nested = false) o = function
   | Simple plan -> render_plan o plan
   | Compound { op; left; right; order_by; limit; offset } ->
       let wrap b =
-        match b with
-        | Simple p when p.order_by <> [] || p.limit <> None || p.offset <> None
-          ->
-            str o "(";
-            render_body ~nested:true o b;
-            str o ")"
-        | Compound _ when not nested ->
-            str o "(";
-            render_body ~nested:true o b;
-            str o ")"
-        | _ -> render_body ~nested:true o b
+        let needs_parens =
+          match b with
+          | Simple p ->
+              p.ctes <> [] || p.order_by <> [] || p.limit <> None
+              || p.offset <> None || p.lock <> None
+          | Compound _ -> not nested
+        in
+        if not needs_parens then render_body ~nested:true o b
+        else if o.dialect = Sqlite then (
+          (* SQLite forbids parenthesised compound SELECT branches; wrap in a
+             derived SELECT * FROM (...) so CTEs / ORDER BY / LIMIT compose. *)
+          str o "SELECT * FROM (";
+          render_body ~nested:true o b;
+          str o ")")
+        else (
+          str o "(";
+          render_body ~nested:true o b;
+          str o ")")
       in
       wrap left;
       str o (compound_sql op);
@@ -866,11 +875,26 @@ let render_count o (Query (_, _, body, _)) =
     when (not plan.distinct) && plan.distinct_on = [] && plan.group_by = [] ->
       render_plan ~for_count:true o plan
   | _ ->
+      let rec strip_locks = function
+        | Simple p -> Simple { p with lock = None }
+        | Compound c ->
+            Compound
+              { c with left = strip_locks c.left; right = strip_locks c.right }
+      in
       let strip_tail = function
         | Simple p ->
-            Simple { p with order_by = []; limit = None; offset = None }
+            Simple
+              { p with order_by = []; limit = None; offset = None; lock = None }
         | Compound c ->
-            Compound { c with order_by = []; limit = None; offset = None }
+            Compound
+              {
+                c with
+                left = strip_locks c.left;
+                right = strip_locks c.right;
+                order_by = [];
+                limit = None;
+                offset = None;
+              }
       in
       str o "SELECT COUNT(*) FROM (";
       render_body o (strip_tail body);

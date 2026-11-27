@@ -261,6 +261,47 @@ let qb_statements dialect =
                (let* o = from Order.table in
                 select (expr o.@(Order.user))))
           |> with_limit 5 |> with_offset 1) );
+    ( "multi-table union of CTEs",
+      Query.to_sql ~dialect
+        Query.(
+          union
+            (build
+               (let* a, id_col =
+                  with_cte "a"
+                    (let* u = from Users.table in
+                     select_named (field "id" u.@(Users.id)))
+                in
+                let* r = from_cte a in
+                select (expr r.@(id_col))))
+            (build
+               (let* b, id_col =
+                  with_cte "b"
+                    (let* o = from Order.table in
+                     select_named (field "id" o.@(Order.user)))
+                in
+                let* r = from_cte b in
+                select (expr r.@(id_col))))) );
+    ( "grouped count strips lock",
+      Query.count_sql ~dialect
+        Query.(
+          build
+            (let* u = from Users.table in
+             let* () = group_by [ Expr.any u.@(Users.name) ] in
+             let* () = for_update ~skip_locked:true () in
+             select (expr u.@(Users.name)))) );
+    ( "right_join and full_join",
+      Query.to_sql ~dialect
+        Query.(
+          build
+            (let* u = from Users.table in
+             let* u, o =
+               right_join u Order.table ~on:(fun o ->
+                   Expr.Ops.(o.@(Order.user) = u.@(Users.id)))
+             in
+             select
+               (let+ name = expr u.@?(Users.name)
+                and+ uid = expr o.@(Order.user) in
+                (name, uid)))) );
     ( "set_expr update",
       from Users.table
       |> where Ops.(Users.id = 1)

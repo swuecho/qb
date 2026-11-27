@@ -942,6 +942,10 @@ module Query : sig
   val ( .@?() ) : 'r opt_ref -> ('r, 'a) col -> 'a option Expr.t
   val ( .@??() ) : 'r opt_ref -> ('r, 'a option) col -> 'a option Expr.t
 
+  val to_opt : 'r ref -> 'r opt_ref
+  (** Views a non-null handle as nullable, e.g. to downgrade additional
+      previously bound left handles after a {!right_join} or {!full_join}. *)
+
   (** {2 Projections} *)
 
   type 'a proj
@@ -987,8 +991,26 @@ module Query : sig
   val from : 'r table -> 'r ref build
   val join : 'r table -> on:('r ref -> bool Expr.t) -> 'r ref build
   val left_join : 'r table -> on:('r ref -> bool Expr.t) -> 'r opt_ref build
-  val right_join : 'r table -> on:('r ref -> bool Expr.t) -> 'r opt_ref build
-  val full_join : 'r table -> on:('r ref -> bool Expr.t) -> 'r opt_ref build
+
+  val right_join :
+    'a ref ->
+    'b table ->
+    on:('b ref -> bool Expr.t) ->
+    ('a opt_ref * 'b ref) build
+  (** [let* u, c = right_join u Comments.table ~on:(fun c -> ...)] rebinds the
+      left handle as nullable (['a opt_ref]) and binds the right table as
+      non-null (['b ref]). If other left handles were bound earlier, downgrade
+      them with {!to_opt}. *)
+
+  val full_join :
+    'a ref ->
+    'b table ->
+    on:('b ref -> bool Expr.t) ->
+    ('a opt_ref * 'b opt_ref) build
+  (** [let* u, c = full_join u Comments.table ~on:(fun c -> ...)] rebinds the
+      left handle as nullable (['a opt_ref]) and binds the right table as
+      nullable (['b opt_ref]). *)
+
   val cross_join : 'r table -> 'r ref build
 
   (** {3 Relation-driven joins} *)

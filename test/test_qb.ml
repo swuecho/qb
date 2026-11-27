@@ -1612,9 +1612,44 @@ let test_multi_sql () =
     {|SELECT (LOWER("t0"."name") || ?), LENGTH("t0"."name"), SUM("t0"."age"), CAST(AVG("t0"."age") AS REAL) FROM "users" AS "t0" GROUP BY "t0"."name" HAVING COUNT(*) > ?|}
     (Query.to_sql ~dialect:Sqlite q_exprs);
   Alcotest.(check string)
-    "grouped count wraps subquery"
-    {|SELECT COUNT(*) FROM (SELECT (LOWER("t0"."name") || ?), CHAR_LENGTH("t0"."name"), CAST(SUM("t0"."age") AS BIGINT), CAST(AVG("t0"."age") AS DOUBLE PRECISION) FROM "users" AS "t0" GROUP BY "t0"."name" HAVING COUNT(*) > ? FOR UPDATE SKIP LOCKED) AS "_qb_count"|}
+    "grouped count wraps subquery and strips FOR UPDATE"
+    {|SELECT COUNT(*) FROM (SELECT (LOWER("t0"."name") || ?), CHAR_LENGTH("t0"."name"), CAST(SUM("t0"."age") AS BIGINT), CAST(AVG("t0"."age") AS DOUBLE PRECISION) FROM "users" AS "t0" GROUP BY "t0"."name" HAVING COUNT(*) > ?) AS "_qb_count"|}
     (Query.count_sql ~dialect:Postgres q_exprs);
+  (* right_join & full_join rebind left handle as nullable *)
+  let q_right =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* u, c =
+           right_join u Comments.table ~on:(fun c ->
+               Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))
+         in
+         select
+           (let+ uname = expr u.@?(Users.name)
+            and+ body = expr c.@(Comments.body) in
+            (uname, body))))
+  in
+  Alcotest.(check string)
+    "right_join sql"
+    {|SELECT "t0"."name", "t1"."body" FROM "users" AS "t0" RIGHT JOIN "comments" AS "t1" ON "t1"."author_id" = "t0"."id"|}
+    (Query.to_sql ~dialect:Postgres q_right);
+  let q_full =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* u, c =
+           full_join u Comments.table ~on:(fun c ->
+               Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))
+         in
+         select
+           (let+ uname = expr u.@?(Users.name)
+            and+ body = expr c.@?(Comments.body) in
+            (uname, body))))
+  in
+  Alcotest.(check string)
+    "full_join sql"
+    {|SELECT "t0"."name", "t1"."body" FROM "users" AS "t0" FULL JOIN "comments" AS "t1" ON "t1"."author_id" = "t0"."id"|}
+    (Query.to_sql ~dialect:Postgres q_full);
   (* CTE + derived table *)
   let q_cte =
     Query.(
@@ -2014,6 +2049,68 @@ let test_multi_db db =
     Query.union adults young |> Blocking.query_all db |> ok |> List.sort compare
   in
   Alcotest.(check (list string)) "union" [ "Ann"; "Bob"; "Cy" ] combined;
+
+  (* UNION of two CTE queries works on both Postgres and SQLite *)
+  let cte_a =
+    Query.(
+      build
+        (let* a, name_col =
+           with_cte "a"
+             (let* u = from Users.table in
+              let* () = where Expr.Ops.(u.@(Users.age) >= Expr.int 50) in
+              select_named (field "name" u.@(Users.name)))
+         in
+         let* r = from_cte a in
+         select (expr r.@(name_col))))
+  in
+  let cte_b =
+    Query.(
+      build
+        (let* b, name_col =
+           with_cte "b"
+             (let* u = from Users.table in
+              let* () = where Expr.Ops.(u.@(Users.age) < Expr.int 20) in
+              select_named (field "name" u.@(Users.name)))
+         in
+         let* r = from_cte b in
+         select (expr r.@(name_col))))
+  in
+  let cte_union =
+    Query.union cte_a cte_b |> Blocking.query_all db |> ok |> List.sort compare
+  in
+  Alcotest.(check (list string)) "union of CTEs" [ "Bob"; "Cy" ] cte_union;
+
+  (* FULL JOIN returns NULL on unmatched side cleanly through opt_ref *)
+  let full_rows =
+    Query.(
+      build
+        (let* c = from Comments.table in
+         let* c, u =
+           full_join c Users.table ~on:(fun u ->
+               Expr.Ops.(u.@(Users.id) = c.@(Comments.author_id)))
+         in
+         let* () =
+           order_by
+             [
+               nulls_last (asc u.@?(Users.id));
+               nulls_last (asc c.@?(Comments.id));
+             ]
+         in
+         select
+           (let+ uname = expr u.@?(Users.name)
+            and+ body = expr c.@?(Comments.body) in
+            (uname, body))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair (option string) (option string))))
+    "full_join with unmatched user"
+    [
+      (Some "Ann", Some "hello");
+      (Some "Bob", Some "hi ann");
+      (Some "Bob", Some "follow up");
+      (Some "Cy", None);
+    ]
+    full_rows;
 
   (* 8. Expression update + upsert with EXCLUDED + update_from + insert_select *)
   ok
