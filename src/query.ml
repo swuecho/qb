@@ -28,14 +28,52 @@ type 'r cond =
 
 let all_rows = True
 
-type 'r assign = Set : ('r, 'a) col * 'a -> 'r assign
+type 'r assign =
+  | Set : ('r, 'a) col * 'a -> 'r assign
+  | Set_expr : ('r, 'a) col * 'a Expr.t -> 'r assign
 
 let set c v = Set (c, v)
+let set_expr c e = Set_expr (c, e)
+let assign_col = function Set (c, _) -> Any c | Set_expr (c, _) -> Any c
+
+let assign_col_name = function
+  | Set (c, _) -> c.name
+  | Set_expr (c, _) -> c.name
+
+let render_assign_value o = function
+  | Set (c, v) -> param o c v
+  | Set_expr (_, e) -> Expr.render o e
+
+(* Keep the last assignment for each column, in first-seen column order, so
+   overriding defaults (e.g. [base @ [ col := v ]]) works consistently across
+   insert, upsert, and update. *)
+let dedup_assigns assigns =
+  let last = Hashtbl.create 8 in
+  List.iter (fun a -> Hashtbl.replace last (assign_col_name a) a) assigns;
+  let seen = Hashtbl.create 8 in
+  List.filter_map
+    (fun a ->
+      let cname = assign_col_name a in
+      if Hashtbl.mem seen cname then None
+      else (
+        Hashtbl.add seen cname ();
+        Hashtbl.find_opt last cname))
+    assigns
+
+let dedup_cols cols =
+  let seen = Hashtbl.create 8 in
+  List.filter
+    (fun (Any c) ->
+      if Hashtbl.mem seen c.name then false
+      else (
+        Hashtbl.add seen c.name ();
+        true))
+    cols
 
 (* A new row: some columns of a table, the rest left to the database. *)
 type 'r values = { vtable : 'r table; vassigns : 'r assign list }
 
-let values vtable vassigns = { vtable; vassigns }
+let values vtable vassigns = { vtable; vassigns = dedup_assigns vassigns }
 
 (* What to do when an insert hits a unique or primary-key conflict. *)
 type 'r on_conflict =
@@ -51,9 +89,16 @@ module On_conflict = struct
   type 'r column = 'r any_col
 
   let col c = Any c
-  let do_nothing ?(target = []) () = Do_nothing target
+  let do_nothing ?(target = []) () = Do_nothing (dedup_cols target)
 
   let do_update ~target ?(set = []) ?(excluded = []) ?where () =
+    let target = dedup_cols target in
+    let set = dedup_assigns set in
+    let set_names = List.map assign_col_name set in
+    let excluded =
+      dedup_cols excluded
+      |> List.filter (fun (Any c) -> not (List.mem c.name set_names))
+    in
     if target = [] then
       invalid_arg "Qb.On_conflict.do_update: target must not be empty";
     if set = [] && excluded = [] then
@@ -75,6 +120,15 @@ module Ops = struct
   let ( && ) a b = And (a, b)
   let ( || ) a b = Or (a, b)
   let not a = Not a
+
+  let all_of = function
+    | [] -> None
+    | c :: cs -> Some (List.fold_left ( && ) c cs)
+
+  let any_of = function
+    | [] -> None
+    | c :: cs -> Some (List.fold_left ( || ) c cs)
+
   let is_in c vs = In (c, vs)
   let not_in c vs = Not (In (c, vs))
   let between c lo hi = And (Cmp (c, Ge, lo), Cmp (c, Le, hi))
@@ -257,13 +311,16 @@ let from table =
 
 let distinct q = { q with distinct = true }
 
-let where cond q =
+let add_where cond q =
   let where =
     match (q.where, cond) with
     | None, c | Some True, c | Some c, True -> c
     | Some w, c -> And (w, c)
   in
   { q with where = Some where }
+
+let where cond q = add_where cond q
+let where_opt cond q = match cond with None -> q | Some c -> add_where c q
 
 let select : type r a b w. (r, b) sel -> (r, a, w) query -> (r, b, w) query =
  fun sel q ->
@@ -472,10 +529,11 @@ let render_insert_many_values o vs =
         List.iter
           (fun v ->
             List.iter
-              (fun (Set (c, _)) ->
-                if not (Hashtbl.mem seen c.name) then (
-                  Hashtbl.add seen c.name ();
-                  acc := c.name :: !acc))
+              (fun a ->
+                let cname = assign_col_name a in
+                if not (Hashtbl.mem seen cname) then (
+                  Hashtbl.add seen cname ();
+                  acc := cname :: !acc))
               v.vassigns)
           vs;
         List.rev !acc
@@ -506,8 +564,9 @@ let render_insert_many_values o vs =
             (fun v ->
               let lookup cname =
                 List.fold_left
-                  (fun acc (Set (c, value)) ->
-                    if c.name = cname then Some (fun () -> param o c value)
+                  (fun acc a ->
+                    if assign_col_name a = cname then
+                      Some (fun () -> render_assign_value o a)
                     else acc)
                   None v.vassigns
               in
@@ -550,10 +609,15 @@ let render_on_conflict o t = function
             name o c.name)
           excluded
         @ List.map
-            (fun (Set (c, v)) () ->
-              name o c.name;
+            (fun a () ->
+              let cname = assign_col_name a in
+              name o cname;
               str o " = ";
-              param o c v)
+              let prev = o.table_qual in
+              o.table_qual <- Some t.tname;
+              Fun.protect
+                ~finally:(fun () -> o.table_qual <- prev)
+                (fun () -> render_assign_value o a))
             set
       in
       sep o ", " (fun f -> f ()) items;
@@ -566,14 +630,15 @@ let render_on_conflict o t = function
 let render_update o assigns q =
   not_joined "Qb: update" q;
   base "Qb: update" q.table;
+  let assigns = dedup_assigns assigns in
   str o "UPDATE ";
   str o (table_name o.dialect q.table);
   str o " SET ";
   sep o ", "
-    (fun (Set (c, v)) ->
-      name o c.name;
+    (fun a ->
+      name o (assign_col_name a);
       str o " = ";
-      param o c v)
+      render_assign_value o a)
     assigns;
   render_where o q.where
 
@@ -600,12 +665,13 @@ let insert_sql ?(dialect = Postgres) t row =
 
 let insert_returning_sql ?(dialect = Postgres) t assigns returning =
   check_nonempty "Qb.insert_returning_sql" returning;
+  let assigns = dedup_assigns assigns in
   match decoder returning with
   | Dec (_, _, cols) ->
       sql_of dialect (fun o ->
           render_insert o t
-            (List.map (fun (Set (c, _)) -> Any c) assigns)
-            (List.map (fun (Set (c, v)) () -> param o c v) assigns);
+            (List.map assign_col assigns)
+            (List.map (fun a () -> render_assign_value o a) assigns);
           str o " RETURNING ";
           col_names o cols)
 
@@ -623,8 +689,8 @@ let insert_many_values_sql ?(dialect = Postgres) vs =
 let upsert_sql ?(dialect = Postgres) conflict v =
   sql_of dialect (fun o ->
       render_insert o v.vtable
-        (List.map (fun (Set (c, _)) -> Any c) v.vassigns)
-        (List.map (fun (Set (c, value)) () -> param o c value) v.vassigns);
+        (List.map assign_col v.vassigns)
+        (List.map (fun a () -> render_assign_value o a) v.vassigns);
       render_on_conflict o v.vtable conflict;
       render_returning o v.vtable.row)
 

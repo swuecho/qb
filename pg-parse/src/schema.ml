@@ -13,11 +13,20 @@ type column = {
   has_default : bool;
 }
 
+type foreign_key = {
+  name : string option;
+  columns : string list;
+  ref_schema : string option;
+  ref_table : string;
+  ref_columns : string list;
+}
+
 type table = {
   schema : string option;
   name : string;
   columns : column list;
   primary_key : string list;
+  foreign_keys : foreign_key list;
 }
 
 type t = { tables : table list; warnings : string list }
@@ -109,24 +118,59 @@ let is_nextval expr =
       | _ -> false)
   | _ -> false
 
-(* A column, and whether it was declared PRIMARY KEY itself. *)
+(* A foreign key constraint node, either inline on a column or table-level. *)
+let foreign_key_of_constraint ?col_name c =
+  match field "pktable" c with
+  | Some pk -> (
+      match str "relname" pk with
+      | Some ref_table ->
+          let columns =
+            match col_name with
+            | Some n -> [ n ]
+            | None -> names (list "fk_attrs" c)
+          in
+          if columns = [] then None
+          else
+            Some
+              {
+                name = str "conname" c;
+                columns;
+                ref_schema = str "schemaname" pk;
+                ref_table;
+                ref_columns = names (list "pk_attrs" c);
+              }
+      | None -> None)
+  | None -> None
+
+(* A column, whether it was declared PRIMARY KEY itself, and any inline
+   REFERENCES foreign keys. *)
 let column_def cd =
   let ty = pg_type (Option.value (field "typeName" cd) ~default:`Null) in
   let ty, serial =
     match serial ty with Some t -> (t, true) | None -> (ty, false)
   in
-  let cs = List.map contype (constraints cd) in
+  let raw_cs = constraints cd in
+  let cs = List.map contype raw_cs in
   let has c = List.mem c cs in
   let nextval =
     List.exists
       (fun c ->
         contype c = "CONSTR_DEFAULT"
         && is_nextval (Option.value (field "raw_expr" c) ~default:`Null))
-      (constraints cd)
+      raw_cs
   in
   let pk = has "CONSTR_PRIMARY" in
+  let col_name = Option.value (str "colname" cd) ~default:"" in
+  let fks =
+    List.filter_map
+      (fun c ->
+        if contype c = "CONSTR_FOREIGN" then
+          foreign_key_of_constraint ~col_name c
+        else None)
+      raw_cs
+  in
   ( {
-      name = Option.value (str "colname" cd) ~default:"";
+      name = col_name;
       ty;
       not_null =
         pk || serial || has "CONSTR_IDENTITY" || has "CONSTR_NOTNULL"
@@ -134,7 +178,8 @@ let column_def cd =
       generated = serial || nextval || has "CONSTR_IDENTITY";
       has_default = has "CONSTR_DEFAULT" || has "CONSTR_GENERATED";
     },
-    pk )
+    pk,
+    fks )
 
 let relation j =
   let r = Option.value (field "relation" j) ~default:`Null in
@@ -183,16 +228,22 @@ let create ~default_schema st body =
         }
     in
     let warnings = ref [] in
-    let cols, pk =
+    let cols, pk, fks =
       List.fold_left
-        (fun (cols, pk) elt ->
+        (fun (cols, pk, fks) elt ->
           match node elt with
           | Some ("ColumnDef", cd) ->
-              let c, is_pk = column_def cd in
-              (cols @ [ c ], if is_pk then pk @ [ c.name ] else pk)
+              let c, is_pk, col_fks = column_def cd in
+              ( cols @ [ c ],
+                (if is_pk then pk @ [ c.name ] else pk),
+                fks @ col_fks )
           | Some ("Constraint", c) when contype c = "CONSTR_PRIMARY" ->
-              (cols, pk @ names (list "keys" c))
-          | Some ("Constraint", _) -> (cols, pk)
+              (cols, pk @ names (list "keys" c), fks)
+          | Some ("Constraint", c) when contype c = "CONSTR_FOREIGN" -> (
+              match foreign_key_of_constraint c with
+              | Some fk -> (cols, pk, fks @ [ fk ])
+              | None -> (cols, pk, fks))
+          | Some ("Constraint", _) -> (cols, pk, fks)
           | Some (kind, _) ->
               warnings :=
                 !warnings
@@ -200,12 +251,18 @@ let create ~default_schema st body =
                     Printf.sprintf "CREATE TABLE %s: %s ignored" (qualified rel)
                       kind;
                   ];
-              (cols, pk)
-          | None -> (cols, pk))
-        ([], []) (list "tableElts" body)
+              (cols, pk, fks)
+          | None -> (cols, pk, fks))
+        ([], [], []) (list "tableElts" body)
     in
     let t =
-      { schema = fst rel; name = snd rel; columns = cols; primary_key = [] }
+      {
+        schema = fst rel;
+        name = snd rel;
+        columns = cols;
+        primary_key = [];
+        foreign_keys = fks;
+      }
     in
     let t = if pk = [] then t else set_pk pk t in
     { tables = st.tables @ [ t ]; warnings = st.warnings @ !warnings }
@@ -249,13 +306,19 @@ let alter_cmd warn (t : table) cmd =
   | Some "AT_AddColumn" -> (
       match node def with
       | Some ("ColumnDef", cd) ->
-          let c, is_pk = column_def cd in
+          let c, is_pk, col_fks = column_def cd in
           if List.exists (fun (x : column) -> x.name = c.name) t.columns then (
             if not (bool "missing_ok" cmd) then
               warn ("column " ^ c.name ^ " already exists");
             t)
           else
-            let t = { t with columns = t.columns @ [ c ] } in
+            let t =
+              {
+                t with
+                columns = t.columns @ [ c ];
+                foreign_keys = t.foreign_keys @ col_fks;
+              }
+            in
             if is_pk then set_pk [ c.name ] t else t
       | _ -> t)
   | Some "AT_DropColumn" ->
@@ -264,6 +327,10 @@ let alter_cmd warn (t : table) cmd =
           t with
           columns = List.filter (fun (c : column) -> c.name <> name) t.columns;
           primary_key = List.filter (( <> ) name) t.primary_key;
+          foreign_keys =
+            List.filter
+              (fun (fk : foreign_key) -> not (List.mem name fk.columns))
+              t.foreign_keys;
         }
       else (
         if not (bool "missing_ok" cmd) then warn ("unknown column " ^ name);
@@ -299,16 +366,24 @@ let alter_cmd warn (t : table) cmd =
       match node def with
       | Some ("Constraint", c) when contype c = "CONSTR_PRIMARY" ->
           set_pk (names (list "keys" c)) t
+      | Some ("Constraint", c) when contype c = "CONSTR_FOREIGN" -> (
+          match foreign_key_of_constraint c with
+          | Some fk -> { t with foreign_keys = t.foreign_keys @ [ fk ] }
+          | None -> t)
       | _ -> t)
   | Some "AT_DropConstraint" ->
-      (* Constraint names aren't tracked, so a dropped primary key can't be
-         told apart from any other constraint. Postgres names primary keys
-         <table>_pkey; warn about those, since the schema may now be wrong,
-         and let foreign keys and unique constraints go quietly. *)
+      (* Primary key constraint names aren't tracked; warn for <table>_pkey.
+         Named foreign keys that match are dropped cleanly. *)
       let n = String.length name in
       if n >= 5 && String.sub name (n - 5) 5 = "_pkey" then
         warn ("DROP CONSTRAINT " ^ name ^ " not tracked");
-      t
+      {
+        t with
+        foreign_keys =
+          List.filter
+            (fun (fk : foreign_key) -> fk.name <> Some name)
+            t.foreign_keys;
+      }
   | Some
       ( "AT_EnableRowSecurity" | "AT_DisableRowSecurity" | "AT_ForceRowSecurity"
       | "AT_NoForceRowSecurity" | "AT_ReplicaIdentity" | "AT_ClusterOn"
@@ -347,23 +422,75 @@ let apply ~default_schema st stmt =
       let newname = Option.value (str "newname" body) ~default:"" in
       match str "renameType" body with
       | Some "OBJECT_TABLE" ->
-          update_table ~default_schema ~missing_ok st rel (fun _ t ->
-              { t with name = newname })
+          let st =
+            update_table ~default_schema ~missing_ok st rel (fun _ t ->
+                { t with name = newname })
+          in
+          let tables =
+            List.map
+              (fun (t : table) ->
+                let foreign_keys =
+                  List.map
+                    (fun (fk : foreign_key) ->
+                      if
+                        fk.ref_table = snd rel
+                        && Option.value fk.ref_schema ~default:default_schema
+                           = Option.value (fst rel) ~default:default_schema
+                      then { fk with ref_table = newname }
+                      else fk)
+                    t.foreign_keys
+                in
+                { t with foreign_keys })
+              st.tables
+          in
+          { st with tables }
       | Some "OBJECT_COLUMN" ->
           let old = Option.value (str "subname" body) ~default:"" in
-          update_table ~default_schema ~missing_ok st rel (fun warn t ->
-              let t =
-                map_column old
-                  (fun (c : column) -> { c with name = newname })
-                  warn t
-              in
-              {
-                t with
-                primary_key =
+          let st =
+            update_table ~default_schema ~missing_ok st rel (fun warn t ->
+                let t =
+                  map_column old
+                    (fun (c : column) -> { c with name = newname })
+                    warn t
+                in
+                let rename_list =
+                  List.map (fun k -> if k = old then newname else k)
+                in
+                {
+                  t with
+                  primary_key = rename_list t.primary_key;
+                  foreign_keys =
+                    List.map
+                      (fun (fk : foreign_key) ->
+                        { fk with columns = rename_list fk.columns })
+                      t.foreign_keys;
+                })
+          in
+          let tables =
+            List.map
+              (fun (t : table) ->
+                let foreign_keys =
                   List.map
-                    (fun k -> if k = old then newname else k)
-                    t.primary_key;
-              })
+                    (fun (fk : foreign_key) ->
+                      if
+                        fk.ref_table = snd rel
+                        && Option.value fk.ref_schema ~default:default_schema
+                           = Option.value (fst rel) ~default:default_schema
+                      then
+                        {
+                          fk with
+                          ref_columns =
+                            List.map
+                              (fun k -> if k = old then newname else k)
+                              fk.ref_columns;
+                        }
+                      else fk)
+                    t.foreign_keys
+                in
+                { t with foreign_keys })
+              st.tables
+          in
+          { st with tables }
       | _ -> st)
   | Some ("DropStmt", body) when str "removeType" body = Some "OBJECT_TABLE" ->
       List.fold_left

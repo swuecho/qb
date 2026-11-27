@@ -190,18 +190,22 @@ let values_fn b cols =
     cols;
   p "           ])\n"
 
-let table_module ~bigint ~module_name:m (t : table) =
-  let b = Buffer.create 1024 in
-  let p fmt = Printf.bprintf b fmt in
+let table_cols (t : table) =
   let fields = uniq (List.map (fun (c : column) -> ident c.name) t.columns) in
-  (* Column values live next to [table], [values] and [by_pk], so a field
-     with one of those names gets a column value called e.g. [table_col]. *)
-  let reserved = [ "table"; "values"; "by_pk" ] in
+  (* Column values live next to [table], [values], [by_pk], [cols] and
+     [opt_cols], so a field with one of those names gets a column value called
+     e.g. [table_col]. *)
+  let reserved = [ "table"; "values"; "by_pk"; "cols"; "opt_cols" ] in
   let values =
     uniq ~taken:reserved
       (List.map (fun f -> if List.mem f reserved then f ^ "_col" else f) fields)
   in
-  let cols = List.combine t.columns (List.combine fields values) in
+  List.combine t.columns (List.combine fields values)
+
+let table_module ~bigint ~module_name:m (t : table) =
+  let b = Buffer.create 1024 in
+  let p fmt = Printf.bprintf b fmt in
+  let cols = table_cols t in
   let single_pk = match t.primary_key with [ k ] -> Some k | _ -> None in
   p "module %s = struct\n" m;
   if List.length t.primary_key > 1 then
@@ -279,6 +283,21 @@ let table_module ~bigint ~module_name:m (t : table) =
           pk_cols;
         p "\n")
   | [] -> ());
+  (* Scoped column accessors for [Qb.Query]: [let u' = Users.cols u] lets you
+     write [u'#name] instead of [u.@(Users.name)], and [opt_cols] automatically
+     flattens nullable columns on outer joins without [option option]. *)
+  p "\n  let cols (r : t Qb.Query.ref) =\n    object\n";
+  List.iter
+    (fun (_, (f, v)) -> p "      method %s = Qb.Query.(r.@(%s))\n" f v)
+    cols;
+  p "    end\n";
+  p "\n  let opt_cols (r : t Qb.Query.opt_ref) =\n    object\n";
+  List.iter
+    (fun ((c : column), (f, v)) ->
+      let op = if c.not_null then ".@?" else ".@??" in
+      p "      method %s = Qb.Query.(r%s(%s))\n" f op v)
+    cols;
+  p "    end\n";
   p "end\n";
   Buffer.contents b
 
@@ -323,6 +342,153 @@ let modules ~bigint named =
          else "\n" ^ table_module ~bigint ~module_name:m t)
        named)
 
+let strip_id_suffix name =
+  let n = String.length name in
+  if n > 3 && String.sub name (n - 3) 3 = "_id" then String.sub name 0 (n - 3)
+  else name
+
+let table_prefix (t : table) =
+  match t.schema with
+  | None | Some "public" -> t.name
+  | Some s -> s ^ "_" ^ t.name
+
+(* Generate [module Relations] for resolvable single-column foreign keys among
+   the emitted tables. Placed after all table modules so forward, circular, and
+   self-referential foreign keys always compile cleanly. *)
+let relations_module ~bigint ~top ~nested =
+  let all_emitted =
+    List.map (fun (t, m) -> (t, m)) top
+    @ List.concat_map
+        (fun (sm, inner) -> List.map (fun (t, m) -> (t, sm ^ "." ^ m)) inner)
+        nested
+  in
+  let find_target ref_schema ref_table =
+    let want_schema = Option.value ref_schema ~default:"public" in
+    List.find_opt
+      (fun ((t : table), _) ->
+        t.name = ref_table
+        && Option.value t.schema ~default:"public" = want_schema)
+      all_emitted
+  in
+  let find_col cols col_name =
+    List.find_opt (fun ((c : column), _) -> c.name = col_name) cols
+  in
+  let resolve_fk child_cols (fk : foreign_key) =
+    match fk.columns with
+    | [ child_col_name ] -> (
+        match find_target fk.ref_schema fk.ref_table with
+        | None -> None
+        | Some (parent, parent_mod) -> (
+            let parent_col_name =
+              match fk.ref_columns with
+              | [ pk ] -> Some pk
+              | [] -> (
+                  match parent.primary_key with [ pk ] -> Some pk | _ -> None)
+              | _ -> None
+            in
+            match parent_col_name with
+            | None -> None
+            | Some pk -> (
+                let parent_cols = table_cols parent in
+                match
+                  (find_col child_cols child_col_name, find_col parent_cols pk)
+                with
+                | Some (cc, (_, cv)), Some (pc, (_, pv))
+                  when pc.not_null
+                       && ocaml_type ~bigint cc.ty = ocaml_type ~bigint pc.ty ->
+                    Some (cc, cv, parent, parent_mod, pc, pv)
+                | _ -> None)))
+    | _ -> None
+  in
+  let raw_entries =
+    List.concat_map
+      (fun ((child : table), child_mod) ->
+        let child_cols = table_cols child in
+        let resolved =
+          List.filter_map (resolve_fk child_cols) child.foreign_keys
+        in
+        let direct =
+          List.concat_map
+            (fun (cc, cv, parent, parent_mod, _pc, pv) ->
+              let belongs_fn =
+                if cc.not_null then "Qb.Rel.belongs_to"
+                else "Qb.Rel.belongs_to_opt"
+              in
+              let has_many_fn =
+                if cc.not_null then "Qb.Rel.has_many" else "Qb.Rel.has_many_opt"
+              in
+              let belongs_name =
+                ident (table_prefix child ^ "_" ^ strip_id_suffix cc.name)
+              in
+              let has_many_name =
+                ident (table_prefix parent ^ "_" ^ table_prefix child)
+              in
+              let belongs_body =
+                Printf.sprintf
+                  "%s ~child_key:%s.%s ~parent:%s.table ~parent_key:%s.%s"
+                  belongs_fn child_mod cv parent_mod parent_mod pv
+              in
+              let has_many_body =
+                Printf.sprintf
+                  "%s ~parent_key:%s.%s ~child:%s.table ~child_key:%s.%s"
+                  has_many_fn parent_mod pv child_mod child_mod cv
+              in
+              [ (belongs_name, belongs_body); (has_many_name, has_many_body) ])
+            resolved
+        in
+        (* Classic join table: composite PK of exactly its two non-null FKs
+           pointing to two distinct tables -> emit both many_to_many directions. *)
+        let m2m =
+          match resolved with
+          | [
+           (cc1, cv1, p1, p1_mod, _pc1, pv1); (cc2, cv2, p2, p2_mod, _pc2, pv2);
+          ]
+            when cc1.not_null && cc2.not_null && p1 != p2 && p1 != child
+                 && p2 != child
+                 && List.length child.primary_key = 2
+                 && List.mem cc1.name child.primary_key
+                 && List.mem cc2.name child.primary_key ->
+              let n12 = ident (table_prefix p1 ^ "_" ^ table_prefix p2) in
+              let b12 =
+                Printf.sprintf
+                  "Qb.Rel.many_to_many ~source_key:%s.%s ~through:%s.table \
+                   ~through_source_key:%s.%s ~through_target_key:%s.%s \
+                   ~target:%s.table ~target_key:%s.%s"
+                  p1_mod pv1 child_mod child_mod cv1 child_mod cv2 p2_mod p2_mod
+                  pv2
+              in
+              let n21 = ident (table_prefix p2 ^ "_" ^ table_prefix p1) in
+              let b21 =
+                Printf.sprintf
+                  "Qb.Rel.many_to_many ~source_key:%s.%s ~through:%s.table \
+                   ~through_source_key:%s.%s ~through_target_key:%s.%s \
+                   ~target:%s.table ~target_key:%s.%s"
+                  p2_mod pv2 child_mod child_mod cv2 child_mod cv1 p1_mod p1_mod
+                  pv1
+              in
+              [ (n12, b12); (n21, b21) ]
+          | _ -> []
+        in
+        direct @ m2m)
+      all_emitted
+  in
+  match raw_entries with
+  | [] -> ""
+  | entries ->
+      let taken_top = List.map snd top @ List.map fst nested in
+      let mod_name =
+        if List.mem "Relations" taken_top then "Qb_relations" else "Relations"
+      in
+      let names = uniq (List.map fst entries) in
+      let b = Buffer.create 512 in
+      Printf.bprintf b "\nmodule %s = struct\n" mod_name;
+      List.iter2
+        (fun name (_, body) ->
+          Printf.bprintf b "  let %s =\n    %s\n" name body)
+        names entries;
+      Buffer.add_string b "end\n";
+      Buffer.contents b
+
 let ocaml ?(bigint = `Int) ?(only = []) (s : Schema.t) =
   let wanted (t : table) =
     only = [] || List.mem t.name only
@@ -339,6 +505,7 @@ let ocaml ?(bigint = `Int) ?(only = []) (s : Schema.t) =
            Printf.sprintf "\nmodule %s = struct%send\n" m
              (indent (modules ~bigint inner)))
          nested)
+  ^ relations_module ~bigint ~top ~nested
 
 (* ---------- queries ---------- *)
 

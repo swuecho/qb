@@ -8,11 +8,20 @@ open Query_ast
 let rec sources schema j =
   match node j with
   | Some ("RangeVar", r) -> (
+      let sc = str "schemaname" r in
       let name = Option.value (str "relname" r) ~default:"" in
-      match find ?schema:(str "schemaname" r) schema name with
+      let full = match sc with Some s -> s ^ "." ^ name | None -> name in
+      match find ?schema:sc schema name with
       | None ->
-          fail ?at:(loc r) "unknown table %s%s" name
-            (hint name (List.map (fun (t : table) -> t.name) schema.tables))
+          let candidates =
+            List.concat_map
+              (fun (t : table) ->
+                match t.schema with
+                | Some s when s <> "public" -> [ t.name; s ^ "." ^ t.name ]
+                | _ -> [ t.name ])
+              schema.tables
+          in
+          fail ?at:(loc r) "unknown table %s%s" full (hint full candidates)
       | Some table ->
           let alias =
             match field "alias" r with
@@ -73,17 +82,26 @@ let column_of env cr =
   | [ Some c ] -> (
       match
         List.filter_map
-          (fun s -> if s.qualified then None else lookup s c)
+          (fun s ->
+            if s.qualified then None
+            else Option.map (fun res -> (s.alias, res)) (lookup s c))
           env.scope
       with
-      | [ x ] -> x
+      | [ (_, x) ] -> x
       | [] ->
           fail ?at "unknown column %s%s" c
             (hint c
                (List.concat_map
                   (fun s -> if s.qualified then [] else column_names s)
                   env.scope))
-      | _ -> fail ?at "column %s is in several tables: write table.%s" c c)
+      | matches ->
+          let qual = List.map (fun (a, _) -> a ^ "." ^ c) matches in
+          let opts =
+            match List.rev qual with
+            | last :: rest -> String.concat ", " (List.rev rest) ^ " or " ^ last
+            | [] -> "table." ^ c
+          in
+          fail ?at "column %s is in several tables: write %s" c opts)
   | [ Some t; Some c ] -> (
       match List.find_opt (fun s -> s.alias = t) env.scope with
       | None -> fail ?at "unknown table %s%s" t (hint t (aliases env))

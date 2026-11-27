@@ -72,11 +72,22 @@ module Schema : sig
     has_default : bool;
   }
 
+  type foreign_key = {
+    name : string option;
+    columns : string list;
+    ref_schema : string option;
+    ref_table : string;
+    ref_columns : string list;
+        (** Empty when the SQL omitted the column list (meaning the referenced
+            table's primary key). *)
+  }
+
   type table = {
     schema : string option;
     name : string;
     columns : column list;
     primary_key : string list;
+    foreign_keys : foreign_key list;
   }
 
   type t = {

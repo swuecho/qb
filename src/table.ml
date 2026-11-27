@@ -52,6 +52,9 @@ type out = {
   mutable variadic : bool;
       (* The text depends on how long a list is (IN, several rows): there is
          no end of such statements, so they aren't kept prepared. *)
+  ref_aliases : (int, string) Hashtbl.t;
+      (* Maps scoped table handle ids to deterministic SQL aliases (t0, t1, ...). *)
+  mutable next_ref : int;
 }
 
 let out dialect =
@@ -62,7 +65,25 @@ let out dialect =
     prefix = [];
     table_qual = None;
     variadic = false;
+    ref_aliases = Hashtbl.create 8;
+    next_ref = 0;
   }
+
+let register_ref o id =
+  match Hashtbl.find_opt o.ref_aliases id with
+  | Some a -> a
+  | None ->
+      let a = "t" ^ string_of_int o.next_ref in
+      o.next_ref <- o.next_ref + 1;
+      Hashtbl.replace o.ref_aliases id a;
+      a
+
+let lookup_ref o id =
+  match Hashtbl.find_opt o.ref_aliases id with
+  | Some a -> a
+  | None ->
+      invalid_arg
+        "Qb.Query: table handle used outside the query that introduced it"
 
 let str o s = Buffer.add_string o.buf s
 let name o n = str o (quote o.dialect n)
@@ -87,9 +108,16 @@ let colname o c =
       str o ".";
       name o c.name
 
-let param o (c : (_, 'a) col) (v : 'a) =
-  o.params <- Param (c.ty.caqti, v) :: o.params;
+let alias_colname o a c =
+  name o a;
+  str o ".";
+  name o c.name
+
+let param_ty o (ty : 'a ty) (v : 'a) =
+  o.params <- Param (ty.caqti, v) :: o.params;
   str o "?"
+
+let param o (c : (_, 'a) col) (v : 'a) = param_ty o c.ty v
 
 let sep o sep f xs =
   List.iteri

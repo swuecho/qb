@@ -148,23 +148,116 @@ module type S = sig
 
   val execute_count :
     db -> unit stmt -> (int, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val query_all :
+    db ->
+    'a Multi.t ->
+    ('a list, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val query_first :
+    db ->
+    'a Multi.t ->
+    ('a option, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val query_one :
+    db -> 'a Multi.t -> ('a, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val query_count :
+    db -> _ Multi.t -> (int, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val insert_select :
+    db ->
+    'r table ->
+    ('r, 'a) sel ->
+    'a Multi.t ->
+    (unit, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val update_from :
+    db ->
+    _ Multi.update_plan ->
+    (unit, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val update_from_count :
+    db ->
+    _ Multi.update_plan ->
+    (int, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val update_from_returning :
+    db ->
+    'r Multi.update_plan ->
+    ('r, 'a) sel ->
+    ('a list, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val delete_using :
+    db ->
+    _ Multi.delete_plan ->
+    (unit, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val delete_using_count :
+    db ->
+    _ Multi.delete_plan ->
+    (int, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val delete_using_returning :
+    db ->
+    'r Multi.delete_plan ->
+    ('r, 'a) sel ->
+    ('a list, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val load_many :
+    ?where:'child cond ->
+    ?order_by:'child order list ->
+    db ->
+    ('parent, 'child) Rel.has_many ->
+    'parent list ->
+    (('parent * 'child list) list, [> Caqti_error.call_or_retrieve ]) result
+    fiber
+
+  val load_one :
+    ?where:'parent cond ->
+    db ->
+    ('child, 'parent) Rel.belongs_to ->
+    'child list ->
+    (('child * 'parent option) list, [> Caqti_error.call_or_retrieve ]) result
+    fiber
+
+  val load_has_one :
+    ?where:'child cond ->
+    db ->
+    ('parent, 'child) Rel.has_one ->
+    'parent list ->
+    (('parent * 'child option) list, [> Caqti_error.call_or_retrieve ]) result
+    fiber
+
+  val load_many_to_many :
+    ?where:('target Multi.ref -> bool Expr.t) ->
+    ?order_by:('target Multi.ref -> Expr.order list) ->
+    db ->
+    ('source, 'target) Rel.many_to_many ->
+    'source list ->
+    (('source * 'target list) list, [> Caqti_error.call_or_retrieve ]) result
+    fiber
 end
 
 module type GUARDED_BACKEND = sig
   include BACKEND
 
+  val bind : 'a fiber -> ('a -> 'b fiber) -> 'b fiber
+  val catch : (unit -> 'a fiber) -> (exn -> 'a fiber) -> 'a fiber
   val finally : (unit -> 'a fiber) -> (unit -> unit) -> 'a fiber
 end
 
-(* The runner; [G.finally] is there for a guarded backend. *)
+(* The runner; [G.guard] is there for a guarded backend. *)
 module Make_with
     (B : BACKEND)
     (G : sig
-      type finally = {
+      type guard = {
+        bind : 'a 'b. 'a B.fiber -> ('a -> 'b B.fiber) -> 'b B.fiber;
+        catch : 'a. (unit -> 'a B.fiber) -> (exn -> 'a B.fiber) -> 'a B.fiber;
         finally : 'a. (unit -> 'a B.fiber) -> (unit -> unit) -> 'a B.fiber;
       }
 
-      val finally : finally option
+      val guard : guard option
     end) =
 struct
   type 'a fiber = 'a B.fiber
@@ -297,12 +390,13 @@ struct
 
   let insert_returning db t assigns returning =
     check_nonempty "Qb.insert_returning" returning;
+    let assigns = dedup_assigns assigns in
     match decoder returning with
     | Dec (rt, decode, cols) -> (
         let o = out_for db in
         render_insert o t
-          (List.map (fun (Set (c, _)) -> Any c) assigns)
-          (List.map (fun (Set (c, v)) () -> param o c v) assigns);
+          (List.map assign_col assigns)
+          (List.map (fun a () -> render_assign_value o a) assigns);
         str o " RETURNING ";
         col_names o cols;
         match Cache.finish o with
@@ -323,8 +417,8 @@ struct
     | Dec (rt, decode, cols) -> (
         let o = out_for db in
         render_insert o v.vtable
-          (List.map (fun (Set (c, _)) -> Any c) v.vassigns)
-          (List.map (fun (Set (c, value)) () -> param o c value) v.vassigns);
+          (List.map assign_col v.vassigns)
+          (List.map (fun a () -> render_assign_value o a) v.vassigns);
         render_on_conflict o v.vtable conflict;
         str o " RETURNING ";
         col_names o cols;
@@ -424,30 +518,67 @@ struct
                 | Ok [] -> Error `Stale
                 | Error _ as e -> refused cs e))
 
-  (* The connections now inside [transaction]. Caqti doesn't nest them: a
-     second BEGIN is ignored by the database and the inner COMMIT then ends
-     the outer transaction early, so that is refused here. It takes
-     [G.finally] to know when a transaction is over, however it ends. *)
+  (* Active transaction nesting depth per connection. The outermost call uses
+     Caqti's [with_transaction]; nested calls use SQL SAVEPOINT / RELEASE /
+     ROLLBACK TO so transactional helpers compose cleanly across Postgres,
+     SQLite, and MySQL. *)
   let in_transaction_mutex = Mutex.create ()
-  let in_transaction : Obj.t list ref = ref []
+  let tx_depth : (Obj.t * int) list ref = ref []
+
+  let enter_tx key =
+    Cache.with_lock in_transaction_mutex (fun () ->
+        let d = Option.value (List.assq_opt key !tx_depth) ~default:0 in
+        tx_depth := (key, d + 1) :: List.remove_assq key !tx_depth;
+        d)
+
+  let leave_tx key =
+    Cache.with_lock in_transaction_mutex (fun () ->
+        let d = Option.value (List.assq_opt key !tx_depth) ~default:0 in
+        tx_depth :=
+          if d <= 1 then List.remove_assq key !tx_depth
+          else (key, d - 1) :: List.remove_assq key !tx_depth)
+
+  let exec_sp (module Db : B.CONNECTION) sql =
+    Db.exec
+      (Caqti_request.create ~oneshot:true Caqti_type.unit Caqti_type.unit
+         Caqti_mult.zero (fun _ -> Caqti_query.L sql))
+      ()
 
   let transaction ((module Db : B.CONNECTION) as db) f =
-    match G.finally with
+    match G.guard with
     | None -> Db.with_transaction f
-    | Some { finally } ->
+    | Some { bind; catch; finally } ->
         let key = Obj.repr db in
-        Cache.with_lock in_transaction_mutex (fun () ->
-            if List.memq key !in_transaction then
-              invalid_arg
-                "Qb.transaction: this connection is already in a transaction, \
-                 and transactions don't nest";
-            in_transaction := key :: !in_transaction);
-        finally
-          (fun () -> Db.with_transaction f)
-          (fun () ->
-            Cache.with_lock in_transaction_mutex (fun () ->
-                in_transaction :=
-                  List.filter (fun k -> k != key) !in_transaction))
+        let depth = enter_tx key in
+        if depth = 0 then
+          finally (fun () -> Db.with_transaction f) (fun () -> leave_tx key)
+        else
+          let sp = Printf.sprintf "qb_sp_%d" depth in
+          let rollback () =
+            bind
+              (exec_sp db ("ROLLBACK TO SAVEPOINT " ^ sp))
+              (fun _ -> exec_sp db ("RELEASE SAVEPOINT " ^ sp))
+          in
+          finally
+            (fun () ->
+              bind
+                (exec_sp db ("SAVEPOINT " ^ sp))
+                (function
+                  | Error _ as e -> B.return e
+                  | Ok () ->
+                      catch
+                        (fun () ->
+                          bind (f ()) (function
+                            | Ok x ->
+                                bind
+                                  (exec_sp db ("RELEASE SAVEPOINT " ^ sp))
+                                  (function
+                                    | Ok () -> B.return (Ok x)
+                                    | Error _ as e -> B.return e)
+                            | Error _ as err ->
+                                bind (rollback ()) (fun _ -> B.return err)))
+                        (fun exn -> bind (rollback ()) (fun _ -> raise exn))))
+            (fun () -> leave_tx key)
 
   let create_table db t =
     let o = out_for db in
@@ -485,28 +616,340 @@ struct
     match pack_args (out_for db).dialect s with
     | sql, ps, Pack (pt, pv) ->
         counted ?name:s.name db ~oneshot:(variadic s) sql ps pt pv
+
+  let query_all db q =
+    match Multi.prepare q with
+    | Multi.Prepared (rt, decode, render) -> (
+        let o = out_for db in
+        render o;
+        match Cache.finish o with
+        | sql, ps, Pack (pt, pv) ->
+            collect_list db ~oneshot:o.variadic sql ps pt pv rt decode)
+
+  let query_first db q =
+    match Multi.prepare ~limit:1 q with
+    | Multi.Prepared (rt, decode, render) -> (
+        let o = out_for db in
+        render o;
+        match Cache.finish o with
+        | sql, ps, Pack (pt, pv) ->
+            find_opt db ~oneshot:o.variadic sql ps pt pv rt decode)
+
+  let query_one db q =
+    match Multi.prepare q with
+    | Multi.Prepared (rt, decode, render) -> (
+        let o = out_for db in
+        render o;
+        match Cache.finish o with
+        | sql, ps, Pack (pt, pv) ->
+            find db ~oneshot:o.variadic sql ps pt pv rt decode)
+
+  let query_count ((module Db : B.CONNECTION) as db) q =
+    let o = out_for db in
+    Multi.render_count o q;
+    match Cache.finish o with
+    | sql, ps, Pack (pt, pv) ->
+        logged sql ps string_of_int (fun () ->
+            Db.find
+              (Cache.request ~oneshot:o.variadic Cache.one pt Caqti_type.int sql)
+              pv)
+
+  let insert_select db target target_sel q =
+    let o = out_for db in
+    Multi.render_insert_select o target target_sel q;
+    exec db o
+
+  let update_from db u =
+    let o = out_for db in
+    Multi.render_update_from o u;
+    exec db o
+
+  let update_from_count db u =
+    let o = out_for db in
+    Multi.render_update_from o u;
+    exec_count db o
+
+  let update_from_returning db u returning =
+    match decoder returning with
+    | Dec (rt, decode, _) -> (
+        let o = out_for db in
+        Multi.render_update_from o u;
+        Multi.render_returning_sel o u.upd_id returning;
+        match Cache.finish o with
+        | sql, ps, Pack (pt, pv) ->
+            collect_list db ~oneshot:o.variadic sql ps pt pv rt decode)
+
+  let delete_using db d =
+    let o = out_for db in
+    Multi.render_delete_using o d;
+    exec db o
+
+  let delete_using_count db d =
+    let o = out_for db in
+    Multi.render_delete_using o d;
+    exec_count db o
+
+  let delete_using_returning db d returning =
+    match decoder returning with
+    | Dec (rt, decode, _) -> (
+        let o = out_for db in
+        Multi.render_delete_using o d;
+        Multi.render_returning_sel o d.del_id returning;
+        match Cache.finish o with
+        | sql, ps, Pack (pt, pv) ->
+            collect_list db ~oneshot:o.variadic sql ps pt pv rt decode)
+
+  let load_many : type p c.
+      ?where:c cond ->
+      ?order_by:c order list ->
+      db ->
+      (p, c) Rel.has_many ->
+      p list ->
+      ((p * c list) list, [> Caqti_error.call_or_retrieve ]) result fiber =
+   fun ?where:extra_where ?order_by:ord db rel parents ->
+    match parents with
+    | [] -> B.return (Ok [])
+    | _ -> (
+        let run : type k.
+            (p, k) col ->
+            c table ->
+            (k list -> c cond) ->
+            (c -> k option) ->
+            ((p * c list) list, [> Caqti_error.call_or_retrieve ]) result fiber
+            =
+         fun parent_key child make_in get_child_key ->
+          let seen = Hashtbl.create (List.length parents) in
+          let keys =
+            List.filter_map
+              (fun p ->
+                let k = parent_key.get p in
+                if Hashtbl.mem seen k then None
+                else (
+                  Hashtbl.add seen k ();
+                  Some k))
+              parents
+          in
+          let q =
+            from child |> Query.where (make_in keys) |> where_opt extra_where
+            |> fun q ->
+            match ord with None -> q | Some o -> Query.order_by o q
+          in
+          all db q
+          |> B.map
+               (Result.map (fun children ->
+                    let grouped = Hashtbl.create (List.length keys) in
+                    List.iter
+                      (fun ch ->
+                        match get_child_key ch with
+                        | Some k ->
+                            let cur =
+                              Option.value
+                                (Hashtbl.find_opt grouped k)
+                                ~default:[]
+                            in
+                            Hashtbl.replace grouped k (ch :: cur)
+                        | None -> ())
+                      children;
+                    List.map
+                      (fun p ->
+                        let k = parent_key.get p in
+                        let cs =
+                          Option.value (Hashtbl.find_opt grouped k) ~default:[]
+                          |> List.rev
+                        in
+                        (p, cs))
+                      parents))
+        in
+        match rel with
+        | Rel.Has_many { parent_key; child; child_key } ->
+            run parent_key child
+              (fun keys -> Ops.is_in child_key keys)
+              (fun ch -> Some (child_key.get ch))
+        | Rel.Has_many_opt { parent_key; child; child_key } ->
+            run parent_key child
+              (fun keys -> Ops.is_in child_key (List.map Option.some keys))
+              (fun ch -> child_key.get ch))
+
+  let load_one : type c p.
+      ?where:p cond ->
+      db ->
+      (c, p) Rel.belongs_to ->
+      c list ->
+      ((c * p option) list, [> Caqti_error.call_or_retrieve ]) result fiber =
+   fun ?where:extra_where db rel children ->
+    match children with
+    | [] -> B.return (Ok [])
+    | _ -> (
+        let run : type k.
+            (c -> k option) ->
+            p table ->
+            (p, k) col ->
+            ((c * p option) list, [> Caqti_error.call_or_retrieve ]) result
+            fiber =
+         fun get_child_key parent parent_key ->
+          let seen = Hashtbl.create (List.length children) in
+          let keys =
+            List.filter_map
+              (fun ch ->
+                match get_child_key ch with
+                | None -> None
+                | Some k ->
+                    if Hashtbl.mem seen k then None
+                    else (
+                      Hashtbl.add seen k ();
+                      Some k))
+              children
+          in
+          match keys with
+          | [] -> B.return (Ok (List.map (fun ch -> (ch, None)) children))
+          | _ ->
+              let q =
+                from parent
+                |> Query.where (Ops.is_in parent_key keys)
+                |> where_opt extra_where
+              in
+              all db q
+              |> B.map
+                   (Result.map (fun parents ->
+                        let by_key = Hashtbl.create (List.length parents) in
+                        List.iter
+                          (fun p -> Hashtbl.replace by_key (parent_key.get p) p)
+                          parents;
+                        List.map
+                          (fun ch ->
+                            let p =
+                              Option.bind (get_child_key ch)
+                                (Hashtbl.find_opt by_key)
+                            in
+                            (ch, p))
+                          children))
+        in
+        match rel with
+        | Rel.Belongs_to { child_key; parent; parent_key } ->
+            run (fun ch -> Some (child_key.get ch)) parent parent_key
+        | Rel.Belongs_to_opt { child_key; parent; parent_key } ->
+            run (fun ch -> child_key.get ch) parent parent_key)
+
+  let load_has_one : type p c.
+      ?where:c cond ->
+      db ->
+      (p, c) Rel.has_one ->
+      p list ->
+      ((p * c option) list, [> Caqti_error.call_or_retrieve ]) result fiber =
+   fun ?where:extra_where db rel parents ->
+    let as_many =
+      match rel with
+      | Rel.Has_one { parent_key; child; child_key } ->
+          Rel.Has_many { parent_key; child; child_key }
+      | Rel.Has_one_opt { parent_key; child; child_key } ->
+          Rel.Has_many_opt { parent_key; child; child_key }
+    in
+    load_many ?where:extra_where db as_many parents
+    |> B.map
+         (Result.map
+            (List.map (fun (p, cs) ->
+                 (p, match cs with c :: _ -> Some c | [] -> None))))
+
+  let load_many_to_many : type s t.
+      ?where:(t Multi.ref -> bool Expr.t) ->
+      ?order_by:(t Multi.ref -> Expr.order list) ->
+      db ->
+      (s, t) Rel.many_to_many ->
+      s list ->
+      ((s * t list) list, [> Caqti_error.call_or_retrieve ]) result fiber =
+   fun ?where:extra_where ?order_by:ord db rel sources ->
+    match sources with
+    | [] -> B.return (Ok [])
+    | _ -> (
+        match rel with
+        | Rel.Many_to_many
+            {
+              source_key;
+              through;
+              through_source_key;
+              through_target_key;
+              target;
+              target_key;
+            } ->
+            let seen = Hashtbl.create (List.length sources) in
+            let keys =
+              List.filter_map
+                (fun s ->
+                  let k = source_key.get s in
+                  if Hashtbl.mem seen k then None
+                  else (
+                    Hashtbl.add seen k ();
+                    Some k))
+                sources
+            in
+            let q =
+              Multi.(
+                build
+                  (let* j = from through in
+                   let* tgt =
+                     join target ~on:(fun tgt ->
+                         Expr.Ops.(tgt.@(target_key) = j.@(through_target_key)))
+                   in
+                   let* () =
+                     where Expr.Ops.(is_in j.@(through_source_key) keys)
+                   in
+                   let* () = opt extra_where (fun f -> where (f tgt)) in
+                   let* () = opt ord (fun f -> order_by (f tgt)) in
+                   select
+                     (let+ sk = expr j.@(through_source_key)
+                      and+ row = whole tgt in
+                      (sk, row))))
+            in
+            query_all db q
+            |> B.map
+                 (Result.map (fun rows ->
+                      let grouped = Hashtbl.create (List.length keys) in
+                      List.iter
+                        (fun (sk, tgt) ->
+                          let cur =
+                            Option.value
+                              (Hashtbl.find_opt grouped sk)
+                              ~default:[]
+                          in
+                          Hashtbl.replace grouped sk (tgt :: cur))
+                        rows;
+                      List.map
+                        (fun s ->
+                          let k = source_key.get s in
+                          let ts =
+                            Option.value
+                              (Hashtbl.find_opt grouped k)
+                              ~default:[]
+                            |> List.rev
+                          in
+                          (s, ts))
+                        sources)))
 end
 
 module Make (B : BACKEND) =
   Make_with
     (B)
     (struct
-      type finally = {
+      type guard = {
+        bind : 'a 'b. 'a B.fiber -> ('a -> 'b B.fiber) -> 'b B.fiber;
+        catch : 'a. (unit -> 'a B.fiber) -> (exn -> 'a B.fiber) -> 'a B.fiber;
         finally : 'a. (unit -> 'a B.fiber) -> (unit -> unit) -> 'a B.fiber;
       }
 
-      let finally = None
+      let guard = None
     end)
 
 module Make_guarded (B : GUARDED_BACKEND) =
   Make_with
     (B)
     (struct
-      type finally = {
+      type guard = {
+        bind : 'a 'b. 'a B.fiber -> ('a -> 'b B.fiber) -> 'b B.fiber;
+        catch : 'a. (unit -> 'a B.fiber) -> (exn -> 'a B.fiber) -> 'a B.fiber;
         finally : 'a. (unit -> 'a B.fiber) -> (unit -> unit) -> 'a B.fiber;
       }
 
-      let finally = Some { finally = B.finally }
+      let guard = Some { bind = B.bind; catch = B.catch; finally = B.finally }
     end)
 
 module Blocking_backend = struct
@@ -517,6 +960,8 @@ module Blocking_backend = struct
 
   let return x = x
   let map f x = f x
+  let bind x f = f x
+  let catch f h = try f () with e -> h e
 
   let finally f after =
     match f () with

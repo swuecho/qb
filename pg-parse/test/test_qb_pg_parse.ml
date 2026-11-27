@@ -188,6 +188,204 @@ let qb_statements dialect =
     ( "order table",
       to_sql ~dialect (from Order.table |> where Ops.(Order.group = Some "g"))
     );
+    ( "multi-table join + group by + having + lock",
+      Query.to_sql ~dialect
+        Query.(
+          build
+            (let* u = from Users.table in
+             let* o =
+               left_join Order.table ~on:(fun o ->
+                   Expr.Ops.(o.@(Order.user) = u.@(Users.id)))
+             in
+             let* () =
+               where
+                 Expr.Ops.(
+                   u.@(Users.age) >= Expr.int 18
+                   && is_not_null o.@??(Order.group))
+             in
+             let* () =
+               group_by [ Expr.any u.@(Users.id); Expr.any u.@(Users.name) ]
+             in
+             let* () = having Expr.Ops.(Expr.count_all >= Expr.int 1) in
+             let* () =
+               order_by
+                 [ desc Expr.count_all; nulls_last (asc u.@(Users.name)) ]
+             in
+             let* () = for_update ~skip_locked:true () in
+             select
+               (let+ name = expr u.@(Users.name)
+                and+ cnt = expr Expr.count_all
+                and+ total = expr (Expr.sum_int u.@(Users.age))
+                and+ avg_age = expr (Expr.avg u.@(Users.age)) in
+                (name, cnt, total, avg_age)))) );
+    ( "multi-table cte + derived + exists + scalar",
+      Query.to_sql ~dialect
+        Query.(
+          build
+            (let* active, uid =
+               with_cte "active_users"
+                 (let* u = from Users.table in
+                  let* () = where Expr.Ops.(u.@(Users.age) >= Expr.int 18) in
+                  select_named (field "id" u.@(Users.id)))
+             in
+             let* a = from_cte active in
+             let* u =
+               join Users.table ~on:(fun u ->
+                   Expr.Ops.(u.@(Users.id) = a.@(uid)))
+             in
+             let* () =
+               where
+                 (exists
+                    (sub
+                       (let* o = from Order.table in
+                        where Expr.Ops.(o.@(Order.user) = u.@(Users.id)))))
+             in
+             let cnt_sub =
+               build
+                 (let* o = from Order.table in
+                  let* () = where Expr.Ops.(o.@(Order.user) = u.@(Users.id)) in
+                  select_one Expr.count_all)
+             in
+             select
+               (let+ name = expr u.@(Users.name)
+                and+ n = expr (Expr.coalesce (scalar cnt_sub) (Expr.int 0)) in
+                (name, n)))) );
+    ( "multi-table union",
+      Query.to_sql ~dialect
+        Query.(
+          union
+            (build
+               (let* u = from Users.table in
+                select (expr u.@(Users.id))))
+            (build
+               (let* o = from Order.table in
+                select (expr o.@(Order.user))))
+          |> with_limit 5 |> with_offset 1) );
+    ( "set_expr update",
+      from Users.table
+      |> where Ops.(Users.id = 1)
+      |> update_sql ~dialect
+           [ set_expr Users.age Expr.Ops.(Expr.col Users.age + Expr.int 1) ] );
+    ( "set_expr upsert",
+      upsert_sql ~dialect
+        On_conflict.(
+          do_update
+            ~target:[ col Users.id ]
+            ~set:
+              [
+                set_expr Users.age
+                  Expr.Ops.(Expr.col Users.age + Expr.excluded Users.age);
+              ]
+            ())
+        (values Users.table
+           Ops.[ Users.id := 1; Users.name := "Ann"; Users.age := 30 ]) );
+    ( "insert_select",
+      Query.insert_select_sql ~dialect Order.table [ Order.user ]
+        Query.(
+          build
+            (let* u = from Users.table in
+             select
+               (let+ id = expr u.@(Users.id) in
+                Row.[ id ]))) );
+    ( "update_from",
+      Query.update_from_sql ~dialect
+        Query.(
+          update_from Users.table (fun u ->
+              let* o = from Order.table in
+              let* () = where Expr.Ops.(o.@(Order.user) = u.@(Users.id)) in
+              return [ set Users.age Expr.Ops.(u.@(Users.age) + Expr.int 1) ]))
+    );
+    ( "delete_using",
+      Query.delete_using_sql ~dialect
+        Query.(
+          delete_using Order.table (fun o ->
+              let* u = from Users.table in
+              where
+                Expr.Ops.(
+                  u.@(Users.id) = o.@(Order.user)
+                  && u.@(Users.age) < Expr.int 18))) );
+    ( "delete_using returning",
+      Query.delete_using_returning_sql ~dialect
+        Query.(
+          delete_using Order.table (fun o ->
+              let* u = from Users.table in
+              where Expr.Ops.(u.@(Users.id) = o.@(Order.user))))
+        (col Order.user) );
+    ( "update_from returning",
+      Query.update_from_returning_sql ~dialect
+        Query.(
+          update_from Users.table (fun u ->
+              let* o = from Order.table in
+              let* () = where Expr.Ops.(o.@(Order.user) = u.@(Users.id)) in
+              return [ set Users.age Expr.Ops.(u.@(Users.age) + Expr.int 1) ]))
+        [ Users.id; Users.age ] );
+    ( "recursive cte",
+      Query.to_sql ~dialect
+        Query.(
+          build
+            (let* r, id_col =
+               with_recursive_cte "chain"
+                 ~base:
+                   (let* u = from Users.table in
+                    select_named (field "id" u.@(Users.id)))
+                 ~step:(fun self id_col ->
+                   let* p = from_cte self in
+                   let* o =
+                     join Order.table ~on:(fun o ->
+                         Expr.Ops.(o.@(Order.user) = p.@(id_col)))
+                   in
+                   select_named (field "id" o.@(Order.user)))
+             in
+             let* x = from_cte r in
+             select (expr x.@(id_col)))) );
+    ( "window functions + filter + distinct on + keyset + jsonb + pg",
+      Query.to_sql ~dialect
+        Query.(
+          build
+            (let* u = from Users.table in
+             let* () = distinct_on [ Expr.any u.@(Users.name) ] in
+             let* () =
+               where
+                 Expr.Ops.(
+                   Expr.Keyset.gt2
+                     (u.@(Users.age), u.@(Users.id))
+                     (Expr.int 18, Expr.int 0)
+                   && Expr.Json.contains u.@(Users.name) (Expr.text "{}")
+                   && Expr.Json.has_key u.@(Users.name) (Expr.text "k")
+                   && Expr.Pg.any_array u.@(Users.name) u.@(Users.name))
+             in
+             let* () = order_by [ asc u.@(Users.name); desc u.@(Users.id) ] in
+             select
+               (let+ rn =
+                  expr
+                    (Expr.row_number
+                       ~partition_by:[ Expr.any u.@(Users.name) ]
+                       ~order_by:[ desc u.@(Users.id) ]
+                       ())
+                and+ rnk = expr (Expr.rank ~order_by:[ desc u.@(Users.age) ] ())
+                and+ drnk =
+                  expr (Expr.dense_rank ~order_by:[ desc u.@(Users.age) ] ())
+                and+ prev =
+                  expr
+                    (Expr.lag_default ~offset:1 ~default:(Expr.text "")
+                       ~order_by:[ asc u.@(Users.id) ]
+                       u.@(Users.name))
+                and+ fv =
+                  expr
+                    (Expr.first_value
+                       ~order_by:[ asc u.@(Users.id) ]
+                       u.@(Users.name))
+                and+ win_sum =
+                  expr
+                    (Expr.sum_int u.@(Users.age)
+                    |> Expr.filter Expr.Ops.(u.@(Users.age) >= Expr.int 18)
+                    |> Expr.over ~partition_by:[ Expr.any u.@(Users.name) ])
+                and+ jp =
+                  expr (Expr.Json.path_text u.@(Users.name) [ "a"; "b" ])
+                and+ jt =
+                  expr (Expr.Json.get_text u.@(Users.name) (Expr.text "role"))
+                in
+                ((rn, rnk, drnk, prev), (fv, win_sum, jp, jt))))) );
   ]
 
 let qb_sql_parses () =
@@ -299,6 +497,182 @@ let composite_and_warnings () =
     "warnings"
     [ "m: DROP CONSTRAINT m_pkey not tracked"; "unknown table nope" ]
     st.warnings
+
+let foreign_keys () =
+  let ddl =
+    {|
+    CREATE TABLE orgs (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL);
+    CREATE TABLE members (
+      id BIGSERIAL PRIMARY KEY,
+      org_id BIGINT NOT NULL REFERENCES orgs (id),
+      invited_by BIGINT,
+      CONSTRAINT members_inviter_fkey FOREIGN KEY (invited_by) REFERENCES members (id)
+    );
+    CREATE TABLE tasks (
+      id BIGSERIAL PRIMARY KEY,
+      assignee_id BIGINT
+    );
+    ALTER TABLE tasks ADD CONSTRAINT tasks_assignee_fkey
+      FOREIGN KEY (assignee_id) REFERENCES members (id);
+    ALTER TABLE orgs RENAME TO companies;
+    ALTER TABLE companies RENAME COLUMN id TO company_id;
+    ALTER TABLE members RENAME COLUMN org_id TO company_id;
+    |}
+  in
+  let st = ok_or_fail ddl (Schema.of_sql ddl) in
+  let members = Option.get (Schema.find st "members") in
+  let tasks = Option.get (Schema.find st "tasks") in
+  Alcotest.(check int) "members has 2 fks" 2 (List.length members.foreign_keys);
+  let fk0 = List.nth members.foreign_keys 0 in
+  Alcotest.(check (list string))
+    "renamed local col" [ "company_id" ] fk0.columns;
+  Alcotest.(check string) "renamed ref table" "companies" fk0.ref_table;
+  Alcotest.(check (list string))
+    "renamed ref col" [ "company_id" ] fk0.ref_columns;
+  let fk1 = List.nth members.foreign_keys 1 in
+  Alcotest.(check (option string))
+    "named constraint" (Some "members_inviter_fkey") fk1.name;
+  Alcotest.(check string) "self ref table" "members" fk1.ref_table;
+  Alcotest.(check int) "tasks ALTER ADD fk" 1 (List.length tasks.foreign_keys);
+  (* Drop named constraint *)
+  let st2 =
+    ok_or_fail ""
+      (Schema.apply_sql ~init:st
+         "ALTER TABLE tasks DROP CONSTRAINT tasks_assignee_fkey;")
+  in
+  let tasks2 = Option.get (Schema.find st2 "tasks") in
+  Alcotest.(check int) "dropped named fk" 0 (List.length tasks2.foreign_keys);
+  (* Join table auto-generates many_to_many in both directions *)
+  let m2m_ddl =
+    {|
+    CREATE TABLE posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL);
+    CREATE TABLE tags (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL);
+    CREATE TABLE post_tags (
+      post_id BIGINT NOT NULL REFERENCES posts (id),
+      tag_id BIGINT NOT NULL REFERENCES tags (id),
+      PRIMARY KEY (post_id, tag_id)
+    );
+    |}
+  in
+  let m2m_src = Codegen.ocaml (ok_or_fail m2m_ddl (Schema.of_sql m2m_ddl)) in
+  let has sub =
+    let n = String.length sub in
+    let rec go i =
+      i + n <= String.length m2m_src
+      && (String.sub m2m_src i n = sub || go (i + 1))
+    in
+    go 0
+  in
+  Alcotest.(check bool)
+    "emits posts_tags many_to_many" true
+    (has
+       "let posts_tags =\n\
+       \    Qb.Rel.many_to_many ~source_key:Posts.id ~through:Post_tags.table \
+        ~through_source_key:Post_tags.post_id \
+        ~through_target_key:Post_tags.tag_id ~target:Tags.table \
+        ~target_key:Tags.id");
+  Alcotest.(check bool)
+    "emits tags_posts many_to_many" true
+    (has
+       "let tags_posts =\n\
+       \    Qb.Rel.many_to_many ~source_key:Tags.id ~through:Post_tags.table \
+        ~through_source_key:Post_tags.tag_id \
+        ~through_target_key:Post_tags.post_id ~target:Posts.table \
+        ~target_key:Posts.id")
+
+let generated_relations_on_sqlite () =
+  let module Db =
+    (val Caqti_blocking.connect (Uri.of_string "sqlite3::memory:")
+         |> Result.fold ~ok:Fun.id ~error:(fun e ->
+             Alcotest.fail (Caqti_error.show e)))
+  in
+  let db = (module Db : Caqti_blocking.CONNECTION) in
+  let get = function
+    | Ok x -> x
+    | Error e -> Alcotest.fail (Caqti_error.show e)
+  in
+  let open Schema_gen in
+  get (Qb.Blocking.create_table db Accounts.table);
+  get (Qb.Blocking.create_table db Articles.table);
+  let now = Ptime.of_float_s 1_700_000_000. |> Option.get in
+  let ann =
+    get
+      (Qb.Blocking.insert_values db
+         (Accounts.values ~email:"ann@example.com" ~active:true ~created_at:now
+            ~login_count:1 ()))
+  in
+  ignore
+    (get
+       (Qb.Blocking.insert_values db
+          (Accounts.values ~email:"bo@example.com" ~active:true ~created_at:now
+             ~login_count:0 ())));
+  ignore
+    (get
+       (Qb.Blocking.insert_values db
+          (Articles.values ~id:"00000000-0000-0000-0000-000000000001"
+             ~account_id:ann.id ~title:"First" ~body:"Body 1" ())));
+  ignore
+    (get
+       (Qb.Blocking.insert_values db
+          (Articles.values ~id:"00000000-0000-0000-0000-000000000002"
+             ~account_id:ann.id ~title:"Second" ~body:"Body 2" ())));
+  (* Generated Relations.accounts_articles works with load_many and Query.left_join_many *)
+  let accounts =
+    get
+      (Qb.(from Accounts.table |> order_by [ asc Accounts.id ])
+      |> Qb.Blocking.all db)
+  in
+  let loaded =
+    get
+      (Qb.Blocking.load_many db Relations.accounts_articles accounts
+         ~order_by:[ Qb.asc Articles.title ])
+  in
+  Alcotest.(check (list (pair string (list string))))
+    "generated has_many load_many"
+    [ ("ann@example.com", [ "First"; "Second" ]); ("bo@example.com", []) ]
+    (List.map
+       (fun ((a : Accounts.t), arts) ->
+         (a.email, List.map (fun (x : Articles.t) -> x.title) arts))
+       loaded);
+  let joined =
+    get
+      (Qb.Query.(
+         build
+           (let* a = from Accounts.table in
+            let* art = left_join_many a Relations.accounts_articles in
+            let a' = Accounts.cols a and art' = Articles.opt_cols art in
+            let* () = order_by [ asc a'#id; nulls_last (asc art'#title) ] in
+            select
+              (let+ email = expr a'#email
+               and+ title = expr art'#title
+               and+ rating = expr art'#rating in
+               (email, title, rating))))
+      |> Qb.Blocking.query_all db)
+  in
+  Alcotest.(
+    check (list (pair string (pair (option string) (option (float 0.01))))))
+    "generated cols/opt_cols + relation left_join_many"
+    [
+      ("ann@example.com", (Some "First", None));
+      ("ann@example.com", (Some "Second", None));
+      ("bo@example.com", (None, None));
+    ]
+    (List.map (fun (e, t, r) -> (e, (t, r))) joined);
+  let articles =
+    get
+      (Qb.(from Articles.table |> order_by [ asc Articles.title ])
+      |> Qb.Blocking.all db)
+  in
+  let with_acct =
+    get (Qb.Blocking.load_one db Relations.articles_account articles)
+  in
+  Alcotest.(check (list (pair string (option string))))
+    "generated belongs_to load_one"
+    [ ("First", Some "ann@example.com"); ("Second", Some "ann@example.com") ]
+    (List.map
+       (fun ((art : Articles.t), acct) ->
+         (art.title, Option.map (fun (a : Accounts.t) -> a.email) acct))
+       with_acct)
 
 (* ---------- Codegen ---------- *)
 
@@ -616,7 +990,7 @@ let query_errors () =
   message "unknown table" "SELECT 1 FROM missing" "unknown table missing";
   message "ambiguous"
     "SELECT id FROM accounts a JOIN articles ar ON ar.account_id = a.id"
-    "column id is in several tables: write table.id";
+    "column id is in several tables: write a.id or ar.id";
   message "parameter with no type"
     "SELECT email FROM accounts WHERE my_fn(email) = :e"
     "can't work out the type of :e: write a cast, e.g. :e::text";
@@ -646,6 +1020,8 @@ let query_errors () =
     "unknown column a.nikname (did you mean nickname?)";
   message "did you mean a table" "SELECT 1 FROM acounts"
     "unknown table acounts (did you mean accounts?)";
+  message "did you mean a schema-qualified table" "SELECT 1 FROM auidt.accounts"
+    "unknown table auidt.accounts (did you mean audit.accounts?)";
   message "did you mean an alias" "SELECT ac.id FROM accounts acc"
     "unknown table ac (did you mean acc?)";
   message "insert leaves out a required column"
@@ -1522,6 +1898,7 @@ let () =
         [
           t "migrations" replays_migrations;
           t "composite, warnings" composite_and_warnings;
+          t "foreign keys" foreign_keys;
         ] );
       ( "queries",
         [
@@ -1547,6 +1924,7 @@ let () =
           t "options" codegen_options;
           t "psql meta-commands" strips_psql_meta;
           t "generated on sqlite" generated_on_sqlite;
+          t "generated relations on sqlite" generated_relations_on_sqlite;
           t "queries on sqlite" queries_on_sqlite;
           (match Sys.getenv_opt "QB_TEST_PG_URL" with
           | Some url -> t "generated on postgres" (generated_on_postgres url)

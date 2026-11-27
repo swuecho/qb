@@ -49,11 +49,46 @@ let no_values dialect ty =
   | Sqlite -> "SELECT NULL WHERE 1 = 0"
   | Mysql -> "SELECT NULL FROM DUAL WHERE 1 = 0"
 
-(* The text to send and its parameters in order. With a list argument, each
-   [$k] is renumbered: a list of three at [$2] becomes [$2, $3, $4] and what
-   was [$3] becomes [$5]. Without one, the text is sent as it is. *)
+(* The text to send and its parameters in order. Validates placeholder bounds
+   for every statement, and renumbers [$k] when a list argument is present: a
+   list of three at [$2] becomes [$2, $3, $4] and what was [$3] becomes [$5]. *)
 let expand dialect s =
   let args = Array.of_list s.args in
+  let nargs = Array.length args in
+  let label = match s.name with Some n -> " (" ^ n ^ ")" | None -> "" in
+  let toks = Sql_tokens.tokens s.sql in
+  let numbered =
+    List.exists
+      (fun (t : Sql_tokens.token) ->
+        match t.kind with Numbered _ -> true | _ -> false)
+      toks
+  in
+  let check_numbered k =
+    if k < 1 || k > nargs then
+      invalid_arg
+        (Printf.sprintf "Qb.Stmt%s: $%d has no argument (%d given)" label k
+           nargs)
+  in
+  (if numbered then
+     List.iter
+       (fun (t : Sql_tokens.token) ->
+         match t.kind with Numbered k -> check_numbered k | _ -> ())
+       toks
+   else
+     let qn =
+       List.fold_left
+         (fun acc (t : Sql_tokens.token) ->
+           match t.kind with Question -> acc + 1 | _ -> acc)
+         0 toks
+     in
+     if qn <> nargs then
+       invalid_arg
+         (Printf.sprintf
+            "Qb.Stmt%s: SQL has %d ? placeholder%s but %d argument%s given"
+            label qn
+            (if qn = 1 then "" else "s")
+            nargs
+            (if nargs = 1 then " was" else "s were")));
   let size = function One _ -> 1 | Many (_, vs) -> List.length vs in
   let params =
     List.concat_map
@@ -65,18 +100,17 @@ let expand dialect s =
   if Array.for_all (function One _ -> true | Many _ -> false) args then
     (s.sql, params)
   else
-    let start = Array.make (Array.length args) 1 in
-    for k = 1 to Array.length args - 1 do
+    let start = Array.make nargs 1 in
+    for k = 1 to nargs - 1 do
       start.(k) <- start.(k - 1) + size args.(k - 1)
     done;
-    let used = Array.make (Array.length args) false in
+    let used = Array.make nargs false in
     let b = Buffer.create (String.length s.sql + 32) in
     List.iter
       (fun (t : Sql_tokens.token) ->
         match t.kind with
         | Numbered k -> (
-            if k < 1 || k > Array.length args then
-              invalid_arg (Printf.sprintf "Qb.Stmt: $%d has no argument" k);
+            check_numbered k;
             used.(k - 1) <- true;
             match args.(k - 1) with
             | One _ -> Printf.bprintf b "$%d" start.(k - 1)
@@ -88,15 +122,15 @@ let expand dialect s =
                     Printf.bprintf b "$%d" (start.(k - 1) + m))
                   vs)
         | _ -> Buffer.add_string b t.text)
-      (Sql_tokens.tokens s.sql);
+      toks;
     Array.iteri
       (fun k u ->
         match args.(k) with
         | Many _ when not u ->
             invalid_arg
               (Printf.sprintf
-                 "Qb.Stmt: the list argument %d is not in the SQL as $%d"
-                 (k + 1) (k + 1))
+                 "Qb.Stmt%s: the list argument %d is not in the SQL as $%d"
+                 label (k + 1) (k + 1))
         | _ -> ())
       used;
     (Buffer.contents b, params)
