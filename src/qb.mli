@@ -171,6 +171,376 @@ val all_rows : 'r cond
 
 val set : ('r, 'a) col -> 'a -> 'r assign
 
+(** {1 SQL expressions and raw fragments}
+
+    Typed SQL expressions for {!Query} and expression-based writes
+    ({!set_expr}). Unlike single-table {!type-cond}, expressions carry their SQL
+    result type ['a] and compose across joins, aggregates, subqueries, and
+    dialect-specific {!Raw} fragments. *)
+
+module Expr : sig
+  type 'a t
+  (** A SQL expression producing values of type ['a]. *)
+
+  type any
+  (** An expression of any type, for {!Query.group_by}, {!Query.distinct_on},
+      and window [PARTITION BY]. *)
+
+  val any : _ t -> any
+
+  type order
+  (** An ordering item, shared by {!Query.order_by} and window [ORDER BY]. *)
+
+  val asc : _ t -> order
+  val desc : _ t -> order
+  val nulls_first : order -> order
+  val nulls_last : order -> order
+
+  (** {2 Columns and literals} *)
+
+  val col : ('r, 'a) col -> 'a t
+  (** A column of the target table in a single-table {!set_expr} assignment. *)
+
+  val excluded : ('r, 'a) col -> 'a t
+  (** [EXCLUDED."col"], for {!On_conflict.do_update} [~set] expressions. *)
+
+  val lit : 'a ty -> 'a -> 'a t
+  (** A bound parameter value of type ['a]. *)
+
+  val int : int -> int t
+  val int64 : int64 -> int64 t
+  val float : float -> float t
+  val text : string -> string t
+  val bool : bool -> bool t
+  val ptime : Ptime.t -> Ptime.t t
+  val date : Ptime.t -> Ptime.t t
+  val uuid : string -> string t
+  val json : string -> string t
+  val null : 'a ty -> 'a option t
+  val some : 'a t -> 'a option t
+
+  (** {2 Scalar SQL functions} *)
+
+  val lower : string t -> string t
+  val upper : string t -> string t
+  val trim : string t -> string t
+  val length : string t -> int t
+  val concat : string t -> string t -> string t
+  val coalesce : 'a option t -> 'a t -> 'a t
+  val coalesce_opt : 'a option t -> 'a option t -> 'a option t
+  val nullif : 'a t -> 'a t -> 'a option t
+  val case_when : (bool t * 'a t) list -> else_:'a t -> 'a t
+  val case_when_opt : (bool t * 'a t) list -> 'a option t
+  val now : unit -> Ptime.t t
+  val cast : 'b ty -> _ t -> 'b t
+
+  (** {2 Aggregates} *)
+
+  val count_all : int t
+  (** Count of all matching rows. *)
+
+  val count : _ t -> int t
+  val count_distinct : _ t -> int t
+  val sum_int : int t -> int option t
+  val sum_int64 : int64 t -> int64 option t
+  val sum_float : float t -> float option t
+  val avg : _ t -> float option t
+  val min : 'a t -> 'a option t
+  val max : 'a t -> 'a option t
+  val min_opt : 'a option t -> 'a option t
+  val max_opt : 'a option t -> 'a option t
+
+  val filter : bool t -> 'a t -> 'a t
+  (** SQL [FILTER (WHERE cond)] on an aggregate (Postgres and SQLite 3.30+):
+      [Expr.count_all |> Expr.filter Expr.Ops.(u.@(Users.age) >= Expr.int 18)].
+  *)
+
+  (** {2 Window functions} *)
+
+  val over : ?partition_by:any list -> ?order_by:order list -> 'a t -> 'a t
+  (** Turns any aggregate (including a {!filter}ed aggregate) into a window
+      function ([OVER (PARTITION BY ... ORDER BY ...)]). For aggregates that
+      emit a Postgres [CAST] ([sum_int], [avg]), [OVER (...)] is placed inside
+      the cast automatically. *)
+
+  val row_number :
+    ?partition_by:any list -> ?order_by:order list -> unit -> int t
+
+  val rank : ?partition_by:any list -> ?order_by:order list -> unit -> int t
+
+  val dense_rank :
+    ?partition_by:any list -> ?order_by:order list -> unit -> int t
+
+  val lag :
+    ?offset:int ->
+    ?partition_by:any list ->
+    ?order_by:order list ->
+    'a t ->
+    'a option t
+
+  val lag_default :
+    ?offset:int ->
+    default:'a t ->
+    ?partition_by:any list ->
+    ?order_by:order list ->
+    'a t ->
+    'a t
+
+  val lead :
+    ?offset:int ->
+    ?partition_by:any list ->
+    ?order_by:order list ->
+    'a t ->
+    'a option t
+
+  val lead_default :
+    ?offset:int ->
+    default:'a t ->
+    ?partition_by:any list ->
+    ?order_by:order list ->
+    'a t ->
+    'a t
+
+  val first_value :
+    ?partition_by:any list -> ?order_by:order list -> 'a t -> 'a option t
+
+  val last_value :
+    ?partition_by:any list -> ?order_by:order list -> 'a t -> 'a option t
+
+  (** {2 Keyset / cursor pagination (tuple comparisons)}
+
+      Renders row-value comparisons like [(a, b) < (?, ?)], supported by
+      Postgres, SQLite, and MySQL. *)
+  module Keyset : sig
+    val gt2 : 'a t * 'b t -> 'a t * 'b t -> bool t
+    val ge2 : 'a t * 'b t -> 'a t * 'b t -> bool t
+    val lt2 : 'a t * 'b t -> 'a t * 'b t -> bool t
+    val le2 : 'a t * 'b t -> 'a t * 'b t -> bool t
+    val gt3 : 'a t * 'b t * 'c t -> 'a t * 'b t * 'c t -> bool t
+    val ge3 : 'a t * 'b t * 'c t -> 'a t * 'b t * 'c t -> bool t
+    val lt3 : 'a t * 'b t * 'c t -> 'a t * 'b t * 'c t -> bool t
+    val le3 : 'a t * 'b t * 'c t -> 'a t * 'b t * 'c t -> bool t
+  end
+
+  (** {2 JSON / JSONB helpers}
+
+      [get] ([->]) and [get_text] ([->>]) work on Postgres and SQLite 3.38+.
+      [contains] ([@>]), [has_key] ([jsonb_exists]), and [path_text]
+      ([jsonb_extract_path_text]) are Postgres JSONB operations. *)
+  module Json : sig
+    val get : string t -> string t -> string option t
+    val get_text : string t -> string t -> string option t
+    val get_opt : string option t -> string t -> string option t
+    val get_text_opt : string option t -> string t -> string option t
+    val contains : string t -> string t -> bool t
+    val contains_opt : string option t -> string t -> bool t
+    val has_key : string t -> string t -> bool t
+    val has_key_opt : string option t -> string t -> bool t
+    val path_text : string t -> string list -> string option t
+    val path_text_opt : string option t -> string list -> string option t
+  end
+
+  (** {2 Postgres-specific expression helpers} *)
+  module Pg : sig
+    val any_array : 'a t -> string t -> bool t
+    (** [e = ANY(arr)] *)
+
+    val date_trunc : string -> Ptime.t t -> Ptime.t t
+    (** [date_trunc(unit, ts)] *)
+  end
+
+  (** Expression operators, meant to be opened locally:
+      [Expr.Ops.(u.@(Users.age) > Expr.int 18 && p.@(Posts.published) =
+       Expr.bool true)]. *)
+  module Ops : sig
+    val ( = ) : 'a t -> 'a t -> bool t
+    val ( <> ) : 'a t -> 'a t -> bool t
+    val ( > ) : 'a t -> 'a t -> bool t
+    val ( >= ) : 'a t -> 'a t -> bool t
+    val ( < ) : 'a t -> 'a t -> bool t
+    val ( <= ) : 'a t -> 'a t -> bool t
+
+    (** Compare a nullable expression with a non-null expression. *)
+
+    val ( =? ) : 'a option t -> 'a t -> bool t
+    val ( <>? ) : 'a option t -> 'a t -> bool t
+    val ( >? ) : 'a option t -> 'a t -> bool t
+    val ( >=? ) : 'a option t -> 'a t -> bool t
+    val ( <? ) : 'a option t -> 'a t -> bool t
+    val ( <=? ) : 'a option t -> 'a t -> bool t
+
+    (** Compare an expression directly against a plain OCaml value (bound as a
+        parameter using the expression's own type, no [Expr.int]/[Expr.text]
+        wrapper needed). [e =. None] renders [IS NULL]. *)
+
+    val ( =. ) : 'a t -> 'a -> bool t
+    val ( <>. ) : 'a t -> 'a -> bool t
+    val ( >. ) : 'a t -> 'a -> bool t
+    val ( >=. ) : 'a t -> 'a -> bool t
+    val ( <. ) : 'a t -> 'a -> bool t
+    val ( <=. ) : 'a t -> 'a -> bool t
+
+    (** Compare a nullable expression directly against a plain non-null OCaml
+        value: [u.@(Users.email) =?. "ann@x.org"]. *)
+
+    val ( =?. ) : 'a option t -> 'a -> bool t
+    val ( <>?. ) : 'a option t -> 'a -> bool t
+    val ( >?. ) : 'a option t -> 'a -> bool t
+    val ( >=?. ) : 'a option t -> 'a -> bool t
+    val ( <?. ) : 'a option t -> 'a -> bool t
+    val ( <=?. ) : 'a option t -> 'a -> bool t
+    val ( && ) : bool t -> bool t -> bool t
+    val ( || ) : bool t -> bool t -> bool t
+    val not : bool t -> bool t
+    val all_of : bool t list -> bool t option
+    val any_of : bool t list -> bool t option
+    val is_null : 'a option t -> bool t
+    val is_not_null : 'a option t -> bool t
+    val is_in : 'a t -> 'a list -> bool t
+    val not_in : 'a t -> 'a list -> bool t
+    val between : 'a t -> 'a t -> 'a t -> bool t
+    val like : string t -> string t -> bool t
+    val ilike : string t -> string t -> bool t
+    val like_opt : string option t -> string t -> bool t
+    val ilike_opt : string option t -> string t -> bool t
+    val ( + ) : int t -> int t -> int t
+    val ( - ) : int t -> int t -> int t
+    val ( * ) : int t -> int t -> int t
+    val ( / ) : int t -> int t -> int t
+    val ( +. ) : float t -> float t -> float t
+    val ( -. ) : float t -> float t -> float t
+    val ( *. ) : float t -> float t -> float t
+    val ( /. ) : float t -> float t -> float t
+    val ( ^ ) : string t -> string t -> string t
+  end
+end
+
+(** Typed raw SQL fragments that compose into any {!Expr.t} (conditions,
+    projections, [ORDER BY], [GROUP BY], [SET]) with safely bound parameters and
+    alias-qualified columns.
+
+    {[
+    let matches_ci col pattern =
+      Qb.Raw.bool
+        [ Qb.Raw.expr col; Qb.Raw.sql " ~* "; Qb.Raw.param Qb.text pattern ]
+    ]}
+
+    Always pass untrusted values via {!Raw.param}, never by string concatenation
+    into {!Raw.sql}. *)
+module Raw : sig
+  type frag
+
+  val sql : string -> frag
+  (** Literal SQL text emitted verbatim. *)
+
+  val param : 'a ty -> 'a -> frag
+  (** A bound Caqti parameter ([?]). *)
+
+  val expr : _ Expr.t -> frag
+  (** Embeds any {!Expr.t} with its table alias qualification intact. *)
+
+  val col : ('r, _) col -> frag
+  (** Embeds a single-table column (for {!set_expr}). *)
+
+  val make : 'a ty -> frag list -> 'a Expr.t
+  (** Combines fragments into an expression decoded with the given {!type-ty}.
+  *)
+
+  val bool : frag list -> bool Expr.t
+  (** Shorthand for [make bool frags]. *)
+end
+
+val set_expr : ('r, 'a) col -> 'a Expr.t -> 'r assign
+(** Assign a SQL expression to a column in {!S.update},
+    {!On_conflict.do_update}, or {!val-values}:
+    [set_expr Users.age Expr.Ops.(Expr.col Users.age + Expr.int 1)]. *)
+
+(** {1 Relations}
+
+    Typed foreign-key descriptors for relation-driven joins ({!Query.join_many},
+    {!Query.left_join_many}, {!Query.join_one}, {!Query.left_join_one}) and
+    batched eager loading ({!S.load_many}, {!S.load_one}). [qb-pg-parse gen]
+    generates a [Relations] module automatically from [REFERENCES] constraints
+    in your migrations.
+
+    {[
+    let user_comments =
+      Qb.Rel.has_many ~parent_key:Users.id ~child:Comments.table
+        ~child_key:Comments.author_id
+
+    let users_with_comments db =
+      let* users = Qb.(from Users.table |> Blocking.all db) in
+      Qb.Blocking.load_many db user_comments users
+        ~order_by:[ Qb.asc Comments.id ]
+    ]} *)
+module Rel : sig
+  type ('parent, 'child) has_many
+  type ('parent, 'child) has_one
+  type ('child, 'parent) belongs_to
+  type ('source, 'target) many_to_many
+
+  val has_many :
+    parent_key:('parent, 'k) col ->
+    child:'child table ->
+    child_key:('child, 'k) col ->
+    ('parent, 'child) has_many
+
+  val has_many_opt :
+    parent_key:('parent, 'k) col ->
+    child:'child table ->
+    child_key:('child, 'k option) col ->
+    ('parent, 'child) has_many
+
+  val has_one :
+    parent_key:('parent, 'k) col ->
+    child:'child table ->
+    child_key:('child, 'k) col ->
+    ('parent, 'child) has_one
+
+  val has_one_opt :
+    parent_key:('parent, 'k) col ->
+    child:'child table ->
+    child_key:('child, 'k option) col ->
+    ('parent, 'child) has_one
+
+  val belongs_to :
+    child_key:('child, 'k) col ->
+    parent:'parent table ->
+    parent_key:('parent, 'k) col ->
+    ('child, 'parent) belongs_to
+
+  val belongs_to_opt :
+    child_key:('child, 'k option) col ->
+    parent:'parent table ->
+    parent_key:('parent, 'k) col ->
+    ('child, 'parent) belongs_to
+
+  val many_to_many :
+    source_key:('source, 'sk) col ->
+    through:'through table ->
+    through_source_key:('through, 'sk) col ->
+    through_target_key:('through, 'tk) col ->
+    target:'target table ->
+    target_key:('target, 'tk) col ->
+    ('source, 'target) many_to_many
+
+  val flatten :
+    ('parent * 'child list) list ->
+    'child list * ('enriched list -> ('parent * 'enriched list) list)
+  (** Composes multi-level batched loading without N+1:
+      {[
+      let* users_posts = Blocking.load_many db Users.posts users in
+      let flat_posts, reattach = Qb.Rel.flatten users_posts in
+      let* posts_comments = Blocking.load_many db Posts.comments flat_posts in
+      let nested = reattach posts_comments
+      ]} *)
+
+  val flatten_opt :
+    ('parent * 'child option) list ->
+    'child list * ('enriched list -> ('parent * 'enriched option) list)
+  (** Like {!flatten} for 1-to-1 / optional child results. *)
+end
+
 type 'r values
 (** A new row of a table of ['r] rows, given as some of its columns; the
     database fills in the rest (identities, defaults, NULL). Run it with
@@ -244,6 +614,14 @@ module Ops : sig
   val ( && ) : 'r cond -> 'r cond -> 'r cond
   val ( || ) : 'r cond -> 'r cond -> 'r cond
   val not : 'r cond -> 'r cond
+
+  val all_of : 'r cond list -> 'r cond option
+  (** Combines conditions with [AND], or [None] for [[]]. Pairs with
+      {!where_opt}. *)
+
+  val any_of : 'r cond list -> 'r cond option
+  (** Combines conditions with [OR], or [None] for [[]]. Pairs with
+      {!where_opt}. *)
 
   val is_in : ('r, 'a) col -> 'a list -> 'r cond
   (** [is_in c []] matches nothing. *)
@@ -330,6 +708,12 @@ val from : 'r table -> ('r, 'r, unfiltered * plain) query
 val where : 'r cond -> ('r, 'a, _ * 'j) query -> ('r, 'a, filtered * 'j) query
 (** Adds a condition; several [where]s are joined with AND. On a joined query it
     still takes the left table's columns (see {!section-joins}). *)
+
+val where_opt :
+  'r cond option -> ('r, 'a, 'f * 'j) query -> ('r, 'a, 'f * 'j) query
+(** Adds a condition when [Some c], and leaves the query unchanged when [None].
+    Preserves whether the query is {!filtered} so [where_opt None] cannot bypass
+    {!S.update} or {!S.delete}'s [where] check. *)
 
 val select :
   ('r, 'b) sel -> ('r, 'a, 'f * plain) query -> ('r, 'b, 'f * plain) query
@@ -531,6 +915,465 @@ val update_returning_sql :
 val delete_returning_sql :
   ?dialect:dialect -> ('r, _, filtered * plain) query -> ('r, _) sel -> string
 
+(** {1 Multi-table query builder}
+
+    A scoped, composable query builder for arbitrary multi-table joins,
+    aggregates, [GROUP BY] / [HAVING], correlated subqueries, CTEs ([WITH]), set
+    operations ([UNION] / [INTERSECT] / [EXCEPT]), row locking, and multi-table
+    writes.
+
+    Each {!Query.from} or join binds a handle (['r ref] for inner/base tables,
+    ['r opt_ref] for outer joins). Access columns with [u.@(Users.name)] on a
+    non-null handle, [c.@?(Comments.body)] on an outer-joined handle (wrapping a
+    non-null column in [option]), or [c.@??(Comments.deleted_at)] for a column
+    that is already nullable (avoiding [option option]).
+
+    {[
+    let q =
+      Qb.Query.(
+        build
+          (let* u = from Users.table in
+           let* c =
+             left_join Comments.table ~on:(fun c ->
+                 Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))
+           in
+           let* () = where Expr.Ops.(u.@(Users.age) > Expr.int 18) in
+           let* () = order_by [ asc u.@(Users.name) ] in
+           select
+             (let+ name = expr u.@(Users.name)
+              and+ body = expr c.@?(Comments.body) in
+              (name, body))))
+    ]} *)
+module Query : sig
+  type 'a t
+  (** A multi-table [SELECT] query returning ['a] rows. Run with {!S.query_all},
+      {!S.query_first}, {!S.query_one}, or {!S.query_count}. *)
+
+  type 'r ref
+  (** A non-null table, CTE, or derived-table handle in scope. *)
+
+  type 'r opt_ref
+  (** A nullable handle from {!left_join}, {!right_join}, or {!full_join}. *)
+
+  type 's cte
+  (** A CTE declared with {!with_cte}, usable in {!from_cte}, {!join_cte}, and
+      {!left_join_cte}. *)
+
+  val ( .@() ) : 'r ref -> ('r, 'a) col -> 'a Expr.t
+  val ( .@?() ) : 'r opt_ref -> ('r, 'a) col -> 'a option Expr.t
+  val ( .@??() ) : 'r opt_ref -> ('r, 'a option) col -> 'a option Expr.t
+
+  val to_opt : 'r ref -> 'r opt_ref
+  (** Views a non-null handle as nullable, e.g. to downgrade additional
+      previously bound left handles after a {!right_join} or {!full_join}. *)
+
+  (** {2 Projections} *)
+
+  type 'a proj
+
+  val expr : 'a Expr.t -> 'a proj
+  val whole : 'r ref -> 'r proj
+  val whole_opt : 'r opt_ref -> 'r option proj
+  val unit : unit proj
+  val map : ('a -> 'b) -> 'a proj -> 'b proj
+  val both : 'a proj -> 'b proj -> ('a * 'b) proj
+  val ( let+ ) : 'a proj -> ('a -> 'b) -> 'b proj
+  val ( and+ ) : 'a proj -> 'b proj -> ('a * 'b) proj
+
+  (** {2 Named projections for CTEs and derived tables} *)
+
+  type ('s, 'a) named
+  type ('s, 'exports) sub_query
+
+  val field : string -> 'a Expr.t -> ('s, ('s, 'a) col) named
+
+  module Named : sig
+    val map : ('a -> 'b) -> ('s, 'a) named -> ('s, 'b) named
+    val both : ('s, 'a) named -> ('s, 'b) named -> ('s, 'a * 'b) named
+    val ( let+ ) : ('s, 'a) named -> ('a -> 'b) -> ('s, 'b) named
+    val ( and+ ) : ('s, 'a) named -> ('s, 'b) named -> ('s, 'a * 'b) named
+  end
+
+  (** {2 Ordering} *)
+
+  type order = Expr.order
+
+  val asc : _ Expr.t -> order
+  val desc : _ Expr.t -> order
+  val nulls_first : order -> order
+  val nulls_last : order -> order
+
+  (** {2 Building queries} *)
+
+  type 'a build
+
+  val return : 'a -> 'a build
+  val ( let* ) : 'a build -> ('a -> 'b build) -> 'b build
+
+  val ( &> ) : unit build -> 'a build -> 'a build
+  (** Sequence clauses without [let* () = ... in] boilerplate:
+      [where cond &> order_by [...] &> limit 20 &> select2 a b]. *)
+
+  val map_build : ('a -> 'b) -> 'a build -> 'b build
+  (** Transforms the handle produced by a build step, e.g.
+      [left_join_many a#ref rel |> map_build Articles.opt_cols]. *)
+
+  val from : 'r table -> 'r ref build
+  val join : 'r table -> on:('r ref -> bool Expr.t) -> 'r ref build
+  val left_join : 'r table -> on:('r ref -> bool Expr.t) -> 'r opt_ref build
+
+  val right_join :
+    'a ref ->
+    'b table ->
+    on:('b ref -> bool Expr.t) ->
+    ('a opt_ref * 'b ref) build
+  (** [let* u, c = right_join u Comments.table ~on:(fun c -> ...)] rebinds the
+      left handle as nullable (['a opt_ref]) and binds the right table as
+      non-null (['b ref]). If other left handles were bound earlier, downgrade
+      them with {!to_opt}. *)
+
+  val full_join :
+    'a ref ->
+    'b table ->
+    on:('b ref -> bool Expr.t) ->
+    ('a opt_ref * 'b opt_ref) build
+  (** [let* u, c = full_join u Comments.table ~on:(fun c -> ...)] rebinds the
+      left handle as nullable (['a opt_ref]) and binds the right table as
+      nullable (['b opt_ref]). *)
+
+  val cross_join : 'r table -> 'r ref build
+
+  (** {3 Relation-driven joins} *)
+
+  val join_many : 'a ref -> ('a, 'b) Rel.has_many -> 'b ref build
+  val left_join_many : 'a ref -> ('a, 'b) Rel.has_many -> 'b opt_ref build
+
+  val left_join_many_opt :
+    'a opt_ref -> ('a, 'b) Rel.has_many -> 'b opt_ref build
+
+  val join_one : 'a ref -> ('a, 'b) Rel.belongs_to -> 'b ref build
+  val left_join_one : 'a ref -> ('a, 'b) Rel.belongs_to -> 'b opt_ref build
+
+  val left_join_one_opt :
+    'a opt_ref -> ('a, 'b) Rel.belongs_to -> 'b opt_ref build
+
+  val join_has_one : 'a ref -> ('a, 'b) Rel.has_one -> 'b ref build
+  val left_join_has_one : 'a ref -> ('a, 'b) Rel.has_one -> 'b opt_ref build
+
+  val left_join_has_one_opt :
+    'a opt_ref -> ('a, 'b) Rel.has_one -> 'b opt_ref build
+
+  val join_m2m : 'a ref -> ('a, 'b) Rel.many_to_many -> 'b ref build
+  val left_join_m2m : 'a ref -> ('a, 'b) Rel.many_to_many -> 'b opt_ref build
+
+  val left_join_m2m_opt :
+    'a opt_ref -> ('a, 'b) Rel.many_to_many -> 'b opt_ref build
+
+  (** {3 CTEs and derived tables} *)
+
+  val select_named : ('s, 'exports) named -> ('s, 'exports) sub_query build
+
+  val with_cte :
+    string -> ('s, 'exports) sub_query build -> ('s cte * 'exports) build
+
+  val with_recursive_cte :
+    ?union_all:bool ->
+    string ->
+    base:('s, 'exports) sub_query build ->
+    step:('s cte -> 'exports -> ('s, _) sub_query build) ->
+    ('s cte * 'exports) build
+  (** [WITH RECURSIVE name AS (base UNION [ALL] step)]. [?union_all] defaults to
+      [true]. *)
+
+  val from_cte : 's cte -> 's ref build
+  val join_cte : 's cte -> on:('s ref -> bool Expr.t) -> 's ref build
+  val left_join_cte : 's cte -> on:('s ref -> bool Expr.t) -> 's opt_ref build
+
+  val from_subquery :
+    ('s, 'exports) sub_query build -> ('s ref * 'exports) build
+
+  val join_subquery :
+    ('s, 'exports) sub_query build ->
+    on:('s ref -> 'exports -> bool Expr.t) ->
+    ('s ref * 'exports) build
+
+  val left_join_subquery :
+    ('s, 'exports) sub_query build ->
+    on:('s ref -> 'exports -> bool Expr.t) ->
+    ('s opt_ref * 'exports) build
+
+  (** {3 Clauses} *)
+
+  val where : bool Expr.t -> unit build
+  val where_opt : bool Expr.t option -> unit build
+
+  val when_ : bool -> (unit -> unit build) -> unit build
+  (** Runs a builder clause conditionally, for dynamic queries. *)
+
+  val opt : 'a option -> ('a -> unit build) -> unit build
+  (** Runs a builder clause when [Some x], leaving the query unchanged on
+      [None]. *)
+
+  val distinct : unit -> unit build
+
+  val distinct_on : Expr.any list -> unit build
+  (** Postgres [SELECT DISTINCT ON (expr, ...)]. *)
+
+  val group_by : Expr.any list -> unit build
+  val having : bool Expr.t -> unit build
+  val having_opt : bool Expr.t option -> unit build
+  val order_by : order list -> unit build
+  val limit : int -> unit build
+  val offset : int -> unit build
+
+  val paginate : page:int -> per_page:int -> unit build
+  (** 1-indexed pagination: sets
+      [LIMIT per_page OFFSET ((page - 1) * per_page)]. Raises [Invalid_argument]
+      if [page < 1] or [per_page < 0]. *)
+
+  val for_update : ?nowait:bool -> ?skip_locked:bool -> unit -> unit build
+  val for_share : ?nowait:bool -> ?skip_locked:bool -> unit -> unit build
+  val select : 'a proj -> 'a t build
+
+  val select_one : 'a Expr.t -> 'a t build
+  (** Selects a single expression; required for {!in_query}, {!not_in_query},
+      and {!scalar} subqueries. *)
+
+  val select1 : 'a Expr.t -> 'a t build
+  (** Alias for {!select_one}. *)
+
+  val select2 : 'a Expr.t -> 'b Expr.t -> ('a * 'b) t build
+  val select3 : 'a Expr.t -> 'b Expr.t -> 'c Expr.t -> ('a * 'b * 'c) t build
+
+  val select4 :
+    'a Expr.t ->
+    'b Expr.t ->
+    'c Expr.t ->
+    'd Expr.t ->
+    ('a * 'b * 'c * 'd) t build
+
+  val build : ?name:string -> 'a t build -> 'a t
+  (** Finalizes a query. When [?name] is given, [Qb.src] debug logs and {!debug}
+      prefix the statement with [[name]]. *)
+
+  val named : string -> 'a t -> 'a t
+  (** Names a query for {!name}, {!debug}, and [Qb.src] logs. *)
+
+  val name : _ t -> string option
+
+  val sub : unit build -> unit t
+  (** Shorthand [SELECT 1 FROM ...] subquery for {!exists} / {!not_exists}. *)
+
+  (** {2 Set operations} *)
+
+  val union : 'a t -> 'a t -> 'a t
+  val union_all : 'a t -> 'a t -> 'a t
+  val intersect : 'a t -> 'a t -> 'a t
+  val except : 'a t -> 'a t -> 'a t
+  val with_limit : int -> 'a t -> 'a t
+  val with_offset : int -> 'a t -> 'a t
+
+  (** {2 Subquery expressions} *)
+
+  val exists : _ t -> bool Expr.t
+  val not_exists : _ t -> bool Expr.t
+  val in_query : 'a Expr.t -> 'a t -> bool Expr.t
+  val not_in_query : 'a Expr.t -> 'a t -> bool Expr.t
+  val scalar : 'a t -> 'a option Expr.t
+  val scalar_opt : 'a option t -> 'a option Expr.t
+
+  (** {2 Multi-table writes} *)
+
+  type 'r update_assign
+  type 'r update_plan
+  type 'r delete_plan
+
+  val set : ('r, 'a) col -> 'a Expr.t -> 'r update_assign
+  val set_val : ('r, 'a) col -> 'a -> 'r update_assign
+
+  val update_from :
+    ?all_rows:bool ->
+    'r table ->
+    ('r ref -> 'r update_assign list build) ->
+    'r update_plan
+  (** [UPDATE target AS t0 SET ... [FROM ...] WHERE ...]. Requires at least one
+      {!where} unless [~all_rows:true] is passed. *)
+
+  val delete_using :
+    ?all_rows:bool -> 'r table -> ('r ref -> unit build) -> 'r delete_plan
+  (** [DELETE FROM target AS t0 [USING ...] WHERE ...]. Requires at least one
+      {!where} unless [~all_rows:true] is passed. *)
+
+  (** {2 SQL rendering} *)
+
+  val to_sql : ?dialect:dialect -> _ t -> string
+
+  val debug : ?dialect:dialect -> _ t -> string
+  (** The rendered SQL together with its formatted bound parameters (and
+      [[name]] prefix if named), for quick inspection without configuring
+      [Logs]. *)
+
+  val count_sql : ?dialect:dialect -> _ t -> string
+  val exists_sql : ?dialect:dialect -> _ t -> string
+
+  val insert_select_sql :
+    ?dialect:dialect -> 'r table -> ('r, 'a) sel -> 'a t -> string
+
+  val update_from_sql : ?dialect:dialect -> _ update_plan -> string
+
+  val update_from_returning_sql :
+    ?dialect:dialect -> 'r update_plan -> ('r, _) sel -> string
+
+  val delete_using_sql : ?dialect:dialect -> _ delete_plan -> string
+
+  val delete_using_returning_sql :
+    ?dialect:dialect -> 'r delete_plan -> ('r, _) sel -> string
+end
+
+(** One-stop local-open DSL for multi-table queries: combines {!Query},
+    {!Expr.Ops} (including [=.]/[>=.] value comparisons), and {!Expr} functions
+    so queries need only one [Qb.Q.( ... )] open.
+
+    {[
+    Qb.Q.(
+      build ~name:"active_comments"
+        (let* u = from Users.table in
+         let* c =
+           left_join Comments.table ~on:(fun c ->
+               c.@(Comments.author_id) = u.@(Users.id))
+         in
+         where (u.@(Users.age) >=. 18 && u.@(Users.name) <>. "Bob")
+         &> order_by [ desc c.@?(Comments.id) ]
+         &> paginate ~page:1 ~per_page:20
+         &> select2 u.@(Users.name) c.@?(Comments.body)))
+    ]} *)
+module Q : sig
+  include
+    module type of Query
+      with type 'a t = 'a Query.t
+       and type 'r ref = 'r Query.ref
+       and type 'r opt_ref = 'r Query.opt_ref
+       and type 's cte = 's Query.cte
+       and type 'a proj = 'a Query.proj
+       and type ('s, 'a) named = ('s, 'a) Query.named
+       and type ('s, 'e) sub_query = ('s, 'e) Query.sub_query
+       and type 'a build = 'a Query.build
+       and type 'r update_assign = 'r Query.update_assign
+       and type 'r update_plan = 'r Query.update_plan
+       and type 'r delete_plan = 'r Query.delete_plan
+
+  include module type of Expr.Ops
+
+  val any : _ Expr.t -> Expr.any
+  val lit : 'a ty -> 'a -> 'a Expr.t
+  val int : int -> int Expr.t
+  val int64 : int64 -> int64 Expr.t
+  val float : float -> float Expr.t
+  val text : string -> string Expr.t
+  val bool : bool -> bool Expr.t
+  val ptime : Ptime.t -> Ptime.t Expr.t
+  val date : Ptime.t -> Ptime.t Expr.t
+  val uuid : string -> string Expr.t
+  val json : string -> string Expr.t
+  val null : 'a ty -> 'a option Expr.t
+  val some : 'a Expr.t -> 'a option Expr.t
+  val lower : string Expr.t -> string Expr.t
+  val upper : string Expr.t -> string Expr.t
+  val trim : string Expr.t -> string Expr.t
+  val length : string Expr.t -> int Expr.t
+  val concat : string Expr.t -> string Expr.t -> string Expr.t
+  val coalesce : 'a option Expr.t -> 'a Expr.t -> 'a Expr.t
+  val coalesce_opt : 'a option Expr.t -> 'a option Expr.t -> 'a option Expr.t
+  val nullif : 'a Expr.t -> 'a Expr.t -> 'a option Expr.t
+  val case_when : (bool Expr.t * 'a Expr.t) list -> else_:'a Expr.t -> 'a Expr.t
+  val case_when_opt : (bool Expr.t * 'a Expr.t) list -> 'a option Expr.t
+  val now : unit -> Ptime.t Expr.t
+  val cast : 'b ty -> _ Expr.t -> 'b Expr.t
+  val count_all : int Expr.t
+  val count : _ Expr.t -> int Expr.t
+  val count_distinct : _ Expr.t -> int Expr.t
+  val sum_int : int Expr.t -> int option Expr.t
+  val sum_int64 : int64 Expr.t -> int64 option Expr.t
+  val sum_float : float Expr.t -> float option Expr.t
+  val avg : _ Expr.t -> float option Expr.t
+  val min : 'a Expr.t -> 'a option Expr.t
+  val max : 'a Expr.t -> 'a option Expr.t
+  val min_opt : 'a option Expr.t -> 'a option Expr.t
+  val max_opt : 'a option Expr.t -> 'a option Expr.t
+  val filter : bool Expr.t -> 'a Expr.t -> 'a Expr.t
+
+  val over :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a Expr.t
+
+  val row_number :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    unit ->
+    int Expr.t
+
+  val rank :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    unit ->
+    int Expr.t
+
+  val dense_rank :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    unit ->
+    int Expr.t
+
+  val lag :
+    ?offset:int ->
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a option Expr.t
+
+  val lag_default :
+    ?offset:int ->
+    default:'a Expr.t ->
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a Expr.t
+
+  val lead :
+    ?offset:int ->
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a option Expr.t
+
+  val lead_default :
+    ?offset:int ->
+    default:'a Expr.t ->
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a Expr.t
+
+  val first_value :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a option Expr.t
+
+  val last_value :
+    ?partition_by:Expr.any list ->
+    ?order_by:Expr.order list ->
+    'a Expr.t ->
+    'a option Expr.t
+
+  module Keyset = Expr.Keyset
+  module Json = Expr.Json
+  module Pg = Expr.Pg
+  module Raw = Raw
+end
+
 (** {1 Statements written as SQL}
 
     For what the builder doesn't do (three tables, aggregates, a condition
@@ -712,6 +1555,14 @@ module Changeset : sig
   val put : ('r, 'a) col -> 'a -> 'r t -> 'r t
   (** A change made by the program, trusted and already typed. Setting a column
       of {!for_update}'s row to the value it has is no change. *)
+
+  val update_change : ('r, 'a) col -> ('a -> 'a) -> 'r t -> 'r t
+  (** Transforms a column's pending change in place (e.g. [String.trim] or
+      [String.lowercase_ascii] before validation). Does nothing when the column
+      has no change or already has an error. *)
+
+  val update_change_opt : ('r, 'a option) col -> ('a -> 'a) -> 'r t -> 'r t
+  (** {!update_change} for a nullable column: leaves [None] alone. *)
 
   val get : ('r, 'a) col -> 'r t -> 'a option
   (** The column's value after the changes: the change, or else the row's value,
@@ -984,11 +1835,13 @@ module type S = sig
       [Ok] and rolled back when it returns [Error] or raises. Run [f]'s queries
       on the same [db].
 
-      Transactions don't nest: the database would take the inner one's commit as
-      the outer one's. Calling [transaction] inside [f] on the same [db] raises
-      [Invalid_argument] (and so rolls the outer one back) in [Qb.Blocking],
-      [Qb_lwt] and any [Qb.Make_guarded]; a plain [Qb.Make] can't tell, so
-      don't. *)
+      Nested [transaction] calls on the same [db] use SQL [SAVEPOINT] /
+      [RELEASE SAVEPOINT] / [ROLLBACK TO SAVEPOINT] in [Qb.Blocking], [Qb_lwt]
+      and any [Qb.Make_guarded], so transactional helpers compose cleanly: an
+      inner [Error] rolls back only the inner savepoint (leaving the outer
+      transaction usable if it handles the error), while an uncaught exception
+      unwinds both. A plain [Qb.Make] delegates directly to Caqti and doesn't
+      nest. *)
 
   val create_table :
     db -> 'r table -> (unit, [> Caqti_error.call_or_retrieve ]) result fiber
@@ -1041,6 +1894,111 @@ module type S = sig
   val execute_count :
     db -> unit stmt -> (int, [> Caqti_error.call_or_retrieve ]) result fiber
   (** {!execute}, returning how many rows the statement changed. *)
+
+  (** {2 Multi-table queries and relational loading} *)
+
+  val query_all :
+    db ->
+    'a Query.t ->
+    ('a list, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val query_first :
+    db ->
+    'a Query.t ->
+    ('a option, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val query_one :
+    db -> 'a Query.t -> ('a, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val query_count :
+    db -> _ Query.t -> (int, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val query_exists :
+    db -> _ Query.t -> (bool, [> Caqti_error.call_or_retrieve ]) result fiber
+  (** Runs [SELECT EXISTS (...)] to check whether at least one row matches. *)
+
+  val insert_select :
+    db ->
+    'r table ->
+    ('r, 'a) sel ->
+    'a Query.t ->
+    (unit, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val update_from :
+    db ->
+    _ Query.update_plan ->
+    (unit, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val update_from_count :
+    db ->
+    _ Query.update_plan ->
+    (int, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val update_from_returning :
+    db ->
+    'r Query.update_plan ->
+    ('r, 'a) sel ->
+    ('a list, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val delete_using :
+    db ->
+    _ Query.delete_plan ->
+    (unit, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val delete_using_count :
+    db ->
+    _ Query.delete_plan ->
+    (int, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val delete_using_returning :
+    db ->
+    'r Query.delete_plan ->
+    ('r, 'a) sel ->
+    ('a list, [> Caqti_error.call_or_retrieve ]) result fiber
+
+  val load_many :
+    ?where:'child cond ->
+    ?order_by:'child order list ->
+    db ->
+    ('parent, 'child) Rel.has_many ->
+    'parent list ->
+    (('parent * 'child list) list, [> Caqti_error.call_or_retrieve ]) result
+    fiber
+  (** Batched 1-to-many eager loader: fetches all children for [parents] in a
+      single [IN] query (zero queries when [parents] is empty) and pairs each
+      parent with its children. *)
+
+  val load_one :
+    ?where:'parent cond ->
+    db ->
+    ('child, 'parent) Rel.belongs_to ->
+    'child list ->
+    (('child * 'parent option) list, [> Caqti_error.call_or_retrieve ]) result
+    fiber
+  (** Batched many-to-1 eager loader: fetches referenced parents in a single
+      [IN] query and pairs each child with its parent. *)
+
+  val load_has_one :
+    ?where:'child cond ->
+    db ->
+    ('parent, 'child) Rel.has_one ->
+    'parent list ->
+    (('parent * 'child option) list, [> Caqti_error.call_or_retrieve ]) result
+    fiber
+  (** Batched 1-to-1 eager loader: fetches child rows in a single [IN] query and
+      pairs each parent with its matching child (if any). *)
+
+  val load_many_to_many :
+    ?where:('target Query.ref -> bool Expr.t) ->
+    ?order_by:('target Query.ref -> Expr.order list) ->
+    db ->
+    ('source, 'target) Rel.many_to_many ->
+    'source list ->
+    (('source * 'target list) list, [> Caqti_error.call_or_retrieve ]) result
+    fiber
+  (** Batched many-to-many eager loader: fetches target rows through the join
+      table in a single [INNER JOIN ... WHERE IN (...)] query and groups them
+      per source row. *)
 end
 
 (** What qb needs to know about a Caqti backend. *)
@@ -1060,17 +2018,21 @@ end
 module Make (B : BACKEND) :
   S with type 'a fiber = 'a B.fiber and type db = (module B.CONNECTION)
 
-(** A backend that can also run something when a fiber ends, however it ends. *)
+(** A backend that can sequence and guard fibers, enabling nested savepoint
+    transactions. *)
 module type GUARDED_BACKEND = sig
   include BACKEND
+
+  val bind : 'a fiber -> ('a -> 'b fiber) -> 'b fiber
+  val catch : (unit -> 'a fiber) -> (exn -> 'a fiber) -> 'a fiber
 
   val finally : (unit -> 'a fiber) -> (unit -> unit) -> 'a fiber
   (** [finally f after] runs [f ()], then [after ()] once its fiber has a result
       or has failed, and gives [f ()]'s outcome. *)
 end
 
-(** {!Make}, whose {!S.transaction} also refuses to nest: {!Blocking} and
-    [Qb_lwt] are made with it. *)
+(** {!Make}, whose {!S.transaction} also supports nested savepoints: {!Blocking}
+    and [Qb_lwt] are made with it. *)
 module Make_guarded (B : GUARDED_BACKEND) :
   S with type 'a fiber = 'a B.fiber and type db = (module B.CONNECTION)
 

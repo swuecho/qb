@@ -6,6 +6,8 @@ module Backend = struct
 
   let return = Lwt.return
   let map = Lwt.map
+  let bind = Lwt.bind
+  let catch = Lwt.catch
 
   let finally f after =
     Lwt.finalize f (fun () ->

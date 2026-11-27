@@ -584,20 +584,19 @@ let* () = execute db (drop_reviews_below 4) in
   3 reviews left
 ```
 
-For a plain insert of one row or an update by key, the builder's `values`
-and `by_pk` from step 5 are shorter, and `values` checks that you gave
-every required column. Reach for SQL when the write needs an expression
-(`pages + :n`), an upsert (`ON CONFLICT`), or another table (`UPDATE ...
-FROM`).
+For a plain insert, upsert, or update by key on one table, the builder's
+`values`, `upsert`, and `by_pk` from step 5 are shorter, and `values` checks
+that you gave every required column. Reach for SQL when the write needs an
+expression (`pages + :n`) or another table (`UPDATE ... FROM`).
 
 ## 14. What a mistake looks like
 
 A column that doesn't exist:
 
 ```
-File "main.ml", line 5, characters 12-13:
+File "main.ml", line 5, characters 12-18:
 5 |       WHERE a.nmae = :author|}]
-                ^
+                ^^^^^^
 Error: unknown column a.nmae (did you mean name?)
 ```
 
@@ -605,15 +604,15 @@ A column two tables have:
 
 ```
 1 | let q = [%sql "SELECT id FROM books b JOIN authors a ON a.id = b.author_id"]
-                          ^
-Error: column id is in several tables: write table.id
+                          ^^
+Error: column id is in several tables: write b.id or a.id
 ```
 
 SQL that Postgres can't parse (the message is Postgres's own):
 
 ```
 1 | let q = [%sql "SELECT title FROM books WHERE year > 1970 ORDER BY"]
-                                                                     ^
+                                                                      ^
 Error: syntax error at end of input
 ```
 
@@ -621,7 +620,7 @@ A parameter with nothing to take its type from:
 
 ```
 1 | let q x = [%sql "SELECT title FROM books WHERE soundex(title) = :x"]
-                                                                    ^
+                                                                    ^^
 Error: can't work out the type of :x: write a cast, e.g. :x::text
 ```
 
@@ -719,9 +718,9 @@ build the files into the binary.
 
 | You want to | Use |
 | --- | --- |
-| Insert, update, delete, or read one table | The builder: `Authors.values`, `by_pk`, `Qb.from ... \|> where ...` (step 5) |
+| Insert, upsert, update, delete, or read one table | The builder: `Authors.values`, `upsert`, `by_pk`, `Qb.from ... \|> where ...` (step 5) |
 | Two or more tables, aggregates, rows without a match | `[%sql "..."]` (steps 7 to 12) |
-| A write with an expression, an upsert, or another table | `[%sql "..."]` (step 13) |
+| A write with an expression or another table | `[%sql "..."]` (step 13) |
 | A join whose conditions are decided at run time, or on SQLite / MySQL | The builder's `join` (step 6) |
 | Anything more: a subquery, a CTE, a `UNION` | `Qb.Stmt.make` by hand, or Caqti directly (step 15) |
 | Create and change the tables on Postgres | `qb-migrate up` (step 16) |

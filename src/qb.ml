@@ -1,9 +1,14 @@
-(* Qb: a Drizzle-style query builder for single-table CRUD on Caqti.
+(* Qb: a typed, Drizzle-style query builder on Caqti.
    See qb.mli for the interface and documentation. *)
 
 include Ty
 include Table
+module Expr = Expr
+module Raw = Expr.Raw
+module Rel = Rel
 include Query
+module Query = Multi
+module Q = Q
 
 type 'a stmt = 'a Stmt.stmt
 

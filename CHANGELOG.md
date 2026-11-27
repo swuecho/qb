@@ -10,17 +10,43 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`qb`**: a typed, Drizzle-style query builder for single-table CRUD on
   Caqti. Select, insert, update, delete and `CREATE TABLE`, with compile-time
-  checks on columns, row types and conditions. Includes changesets, thread- and
-  domain-safe statement caching, logging (including named statements),
-  transactions, prepared statements, `RETURNING`, `distinct`,
-  `nulls_first` / `nulls_last` ordering, `insert_many`, `insert_many_values`,
-  single-table upserts (`On_conflict`, `upsert`, `upsert_many`), and a
-  two-table join.
+  checks on columns, row types and conditions. Includes changesets (with
+  `update_change` / `update_change_opt`), thread- and domain-safe statement
+  caching, logging (including named statements), composable nested savepoint
+  transactions, prepared statements, `RETURNING`, `distinct`, `where_opt` /
+  `Ops.all_of` / `Ops.any_of`, `nulls_first` / `nulls_last` ordering,
+  `insert_many`, `insert_many_values`, single-table upserts (`On_conflict`,
+  `upsert`, `upsert_many`), deduplicated column assignments, `Stmt` placeholder
+  validation, and a two-table join.
+- **`qb` multi-table builder**: `Qb.Q` (one-stop local-open DSL combining
+  `Qb.Query`, `Qb.Expr.Ops`, value comparisons `=.`/`>=.`/`=?.`, `&>` clause
+  sequencing, `select1`–`select4`, `paginate`, `debug`, `named`, and
+  `query_exists`), `Qb.Expr` (typed SQL expressions, scalar
+  functions, aggregates with `FILTER (WHERE ...)`, window functions
+  `row_number`/`rank`/`dense_rank`/`lag`/`lead`/`first_value`/`last_value`/`over`,
+  `Expr.Keyset` tuple comparisons for cursor pagination, `Expr.Json` /
+  `Expr.Pg` helpers, `CASE`, `COALESCE`, `EXCLUDED`), `Qb.Raw` (typed raw SQL
+  fragments with bound parameters), `set_expr` (expression assignments in
+  updates and upserts), `Qb.Query` (scoped `let*` multi-table joins across
+  arbitrary tables, `DISTINCT ON`, `GROUP BY` / `HAVING`, correlated `EXISTS` /
+  `IN` / scalar subqueries, CTEs via `with_cte` and `with_recursive_cte`,
+  derived tables, `when_` / `opt` dynamic clauses, `UNION` / `INTERSECT` /
+  `EXCEPT`, `FOR UPDATE` / `FOR SHARE` row locking, and multi-table
+  `insert_select`, `update_from` / `update_from_returning`, `delete_using` /
+  `delete_using_returning`), and `Qb.Rel` (typed `has_many`, `has_one`,
+  `belongs_to`, and `many_to_many` relations with relation-driven joins,
+  `Rel.flatten` / `Rel.flatten_opt` for multi-level nesting, and batched
+  `load_many` / `load_one` / `load_has_one` / `load_many_to_many` eager
+  loading).
 - **`qb-lwt`**: the same queries, changesets and transactions on
   `Caqti_lwt` connections.
 - **`qb-pg-parse`**: bindings to libpg_query (releasing the OCaml runtime lock
-  while parsing) to check SQL, replay migrations into a schema, generate qb
-  table modules (including `by_pk` for both single and composite primary keys),
+  while parsing) to check SQL, replay migrations into a schema (including
+  `FOREIGN KEY` constraints across `CREATE`, `ALTER`, `RENAME`, and `DROP`),
+  generate qb table modules (including `by_pk` for both single and composite
+  primary keys, scoped `from`/`join`/`left_join` and `cols`/`opt_cols` with
+  `#ref`/`#whole`, and a `Relations` module of typed `Qb.Rel` descriptors
+  including auto-detected `many_to_many` join tables),
   and type SQL queries (including simple/searched `CASE`, `NULLIF`,
   `GREATEST`/`LEAST`, and boolean parameter inference). `gen`, `queries`, and
   `check` accept directories as well as individual `.sql` files, and `init`

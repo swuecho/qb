@@ -174,8 +174,7 @@ let demo () =
   let books_of_year year =
     Qb.(
       from Books.table
-      |> where
-           (match year with Some y -> Ops.(Books.year = y) | None -> all_rows)
+      |> where_opt (Option.map (fun y -> Ops.(Books.year = y)) year)
       |> count db)
   in
   let* all_books = books_of_year None in

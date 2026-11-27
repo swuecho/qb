@@ -23,17 +23,15 @@ out, and what it refuses. For a walkthrough, start with the
 
 | Query | Use |
 | --- | --- |
-| One table: insert, upsert, read, update, delete | The builder |
-| Two or more tables, aggregates, anything grouped | SQL: `[%sql]` |
-| A write with an expression or a second table | SQL: `[%sql]` |
-| A join whose conditions are decided at run time, or a database that isn't Postgres | The builder's `join` |
-| Anything more: a subquery, `WITH`, `UNION` | `Qb.Stmt.make`, or Caqti directly |
+| One table: insert, upsert, read, update, delete | Single-table builder (`Qb.from`) |
+| Dynamic multi-table joins, aggregates, subqueries, CTEs, recursive CTEs, or SQLite / MySQL portability | Multi-table builder ([`Qb.Query`, `Qb.Expr`, `Qb.Rel`](query.md)) |
+| Static Postgres SQL over multiple tables where raw SQL reads clearest | `[%sql]` (`qb-ppx`) or `qb-pg-parse queries` |
+| Batched nested parent/child loading (no N+1) | `Qb.Rel` + `load_many` / `load_one` ([guide](query.md#relations-qbrel-and-batched-eager-loading)) |
+| Unparsed or driver-specific static SQL | `Qb.Stmt.make`, or Caqti directly |
 
-The builder's two-table join is deliberately narrow: one join, conditions
-and order on the left table only, no aggregates, read only. It is there for
-the two cases in the table, not as the usual way to join. The
-[tutorial](tutorial.md#6-the-builders-join-and-when-to-use-it) lists its
-limits.
+The single-table builder's `Qb.join` / `Qb.left_join` remains available for
+quick two-table queries (one join, conditions and order on the left table
+only); for anything richer in OCaml, use [`Qb.Query`](query.md) or `[%sql]`.
 
 ## Three ways to write a statement
 
@@ -441,7 +439,7 @@ In `[%sql]` these are compile errors at the place in the string; from
 | `syntax error at or near "..."` | Postgres's parser rejected the SQL. |
 | `unknown table t` | Not in the schema, or an alias that isn't in `FROM`. A near miss adds `(did you mean ...?)`. |
 | `unknown column c`, `unknown column t.c` | Not a column of the tables in `FROM`. A near miss adds `(did you mean ...?)`. |
-| `column c is in several tables: write table.c` | Qualify it. |
+| `column c is in several tables: write a.c or b.c` | Qualify it with one of the table aliases in scope. |
 | `table t is named twice: give one an alias` | A self-join needs aliases. |
 | `:p is a list in one place (IN :p) and a single value in another` | Use two names. |
 | `a list can't be NULL: write IN :p` | Drop the `?`. |

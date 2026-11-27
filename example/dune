@@ -12,3 +12,8 @@
  (name join)
  (modules join)
  (libraries qb caqti.blocking caqti-driver-sqlite3 uri))
+
+(executable
+ (name multi)
+ (modules multi)
+ (libraries qb caqti.blocking caqti-driver-sqlite3 uri))

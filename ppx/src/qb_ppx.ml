@@ -40,7 +40,8 @@ let () =
    both. *)
 let search_dirs dir =
   let dir =
-    if Filename.is_relative dir then Filename.concat (Sys.getcwd ()) dir
+    if dir = Filename.current_dir_name then Sys.getcwd ()
+    else if Filename.is_relative dir then Filename.concat (Sys.getcwd ()) dir
     else dir
   in
   let is_root d =
@@ -73,6 +74,21 @@ let sql_files ~dir path =
     |> List.map (Filename.concat path)
   else [ path ]
 
+let searched_summary ~dir =
+  let dirs = search_dirs dir in
+  let root = match List.rev dirs with r :: _ -> r | [] -> "" in
+  let rlen = String.length root in
+  let rel d =
+    if d = root then "."
+    else if
+      String.length d > rlen
+      && String.sub d 0 rlen = root
+      && d.[rlen] = Filename.dir_sep.[0]
+    then String.sub d (rlen + 1) (String.length d - rlen - 1)
+    else d
+  in
+  String.concat ", " (List.map rel dirs)
+
 let load ~dir =
   if !schema_paths = [] then
     Error
@@ -92,8 +108,10 @@ let load ~dir =
                 match In_channel.with_open_bin file In_channel.input_all with
                 | exception Sys_error m ->
                     Error
-                      (Printf.sprintf "schema: %s (is it in preprocessor_deps?)"
-                         m)
+                      (Printf.sprintf
+                         "schema: %s (looked in %s; is it in \
+                          preprocessor_deps?)"
+                         m (searched_summary ~dir))
                 | sql -> (
                     let sql = Pg.strip_psql_meta sql in
                     match Schema.apply_sql ~init:st sql with

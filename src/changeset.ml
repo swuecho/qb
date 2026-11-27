@@ -91,7 +91,9 @@ let get_change : type r a. (r, a) col -> r t -> a option =
       | Some Caqti_type.Equal -> Some v
       | None -> None
   in
-  List.find_map (fun (Set (c', v)) -> same_col c' v) cs.changes
+  List.find_map
+    (function Set (c', v) -> same_col c' v | Set_expr _ -> None)
+    cs.changes
 
 let get c cs =
   match get_change c cs with
@@ -101,7 +103,7 @@ let get c cs =
 let drop_change c cs =
   {
     cs with
-    changes = List.filter (fun (Set (c', _)) -> c'.name <> c.name) cs.changes;
+    changes = List.filter (fun a -> assign_col_name a <> c.name) cs.changes;
   }
 
 let same a b = try a = b with Invalid_argument _ -> false
@@ -112,6 +114,17 @@ let put c v cs =
   match cs.data with
   | Some row when same (c.get row) v -> cs
   | _ -> { cs with changes = cs.changes @ [ Set (c, v) ] }
+
+let update_change c f cs =
+  if has_error c.name cs then cs
+  else match get_change c cs with None -> cs | Some v -> put c (f v) cs
+
+let update_change_opt c f cs =
+  if has_error c.name cs then cs
+  else
+    match get_change c cs with
+    | None | Some None -> cs
+    | Some (Some v) -> put c (Some (f v)) cs
 
 let cast params fields cs =
   let allowed = List.map (fun (Field c) -> c.name) fields in

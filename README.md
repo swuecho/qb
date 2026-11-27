@@ -68,6 +68,11 @@ let ann = Qb.Blocking.insert_values db Qb.(values Users.table Ops.[ Users.name :
 
 ## Documentation
 
+- [Multi-table builder tutorial](doc/query-tutorial.md): hands-on walkthrough
+  from two tables to self-joins, `GROUP BY`, recursive CTEs, and `load_many`.
+- [Multi-table builder & relations reference](doc/query.md): `Qb.Query`,
+  `Qb.Expr`, `Qb.Raw`, `Qb.Rel`, CTEs / recursive CTEs, subqueries, multi-table
+  writes, and batched eager loading.
 - [Tutorial](doc/tutorial.md): `[%sql]` from an empty project to three-table
   queries with aggregates.
 - [SQL reference](doc/sql.md): every typing rule, what is rejected, and each
@@ -75,7 +80,8 @@ let ann = Qb.Blocking.insert_values db Qb.(values Users.table Ops.[ Users.name :
 - [Migrations reference](doc/migrate.md): how `qb-migrate` applies and verifies
   migrations.
 - [`example/`](example): runnable examples. `dune exec ./example/join.exe`,
-  `dune exec ./example/users.exe` and `dune exec ./example/sql/main.exe`.
+  `dune exec ./example/multi.exe`, `dune exec ./example/users.exe` and
+  `dune exec ./example/sql/main.exe`.
 - The API reference is in the `.mli` files; `dune build @doc` renders it with
   odoc.
 
@@ -94,6 +100,51 @@ let ann = Qb.Blocking.insert_values db Qb.(values Users.table Ops.[ Users.name :
 - **`qb-migrate`**: applies those same migrations to a Postgres database,
   and checks that the database matches what your queries were compiled
   against. See below.
+
+## Multi-table queries & relations: `Qb.Q`, `Qb.Query`, `Qb.Expr`, `Qb.Rel`
+
+When a query spans several tables, aggregates, subqueries, CTEs, or dynamic
+filters across joins, open `Qb.Q` (which combines `Qb.Query`, `Qb.Expr.Ops`,
+value comparisons like `=.`/`>=.`, `&>`, and `select1`–`select4`):
+
+```ocaml
+let thread db =
+  Qb.Q.(
+    build ~name:"comment_thread"
+      (let* c = from Comments.table in
+       let* author =
+         join Users.table ~on:(fun u -> u.@(Users.id) = c.@(Comments.author_id))
+       in
+       let* parent =
+         left_join Comments.table ~on:(fun p ->
+             c.@(Comments.reply_to) =? p.@(Comments.id))
+       in
+       where (author.@(Users.age) >=. 18)
+       &> order_by [ asc c.@(Comments.id) ]
+       &> select3 c.@(Comments.body) author.@(Users.name) parent.@?(Comments.body)))
+  |> Qb.Blocking.query_all db
+```
+
+- **Compile-time table scope & nullability:** `.@()` reads a column from a
+  non-null handle (`from`/`join`), `.@?()` wraps a column from a `left_join`
+  handle in `option`, and `.@??()` keeps an already-nullable column as
+  `'a option` (no `option option`). Self-joins get distinct aliases
+  automatically.
+- **Expressions & raw fragments:** `Qb.Expr` provides scalar functions,
+  `coalesce`, `case_when`, aggregates (`count`, `sum_int`, `avg`, `min`, `max`),
+  and `set_expr` (including `Expr.excluded` in upserts). `Qb.Raw` embeds
+  dialect-specific SQL fragments with safely bound parameters.
+- **Subqueries, CTEs & set ops:** `exists`, `not_exists`, `in_query`, `scalar`,
+  `with_cte`, `with_recursive_cte`, `from_subquery`/`left_join_subquery`,
+  `when_`/`opt` dynamic clauses, `union`/`intersect`/`except`,
+  `for_update`/`for_share`, and `insert_select`/`update_from`/`delete_using`
+  (including `RETURNING`).
+- **Typed relations & batched eager loading:** `Qb.Rel` (`has_many`,
+  `belongs_to`) powers relation-driven joins (`left_join_many`, `join_one`) and
+  N+1-free batched loading (`load_many`, `load_one`). `qb-pg-parse gen` emits
+  scoped `cols`/`opt_cols` accessors (`u'#email`, `art'#title`) and a
+  `Relations` module automatically from `REFERENCES` constraints in your
+  migrations.
 
 ## Writes from a form: `Qb.Changeset`
 
@@ -284,13 +335,15 @@ migrations into a binary.
   `upsert_many` add typed `ON CONFLICT` (`On_conflict.do_nothing` /
   `On_conflict.do_update` with `~excluded`, `~set`, and `~where`).
 - **Transactions.** `transaction db (fun () -> ...)` commits on `Ok` and
-  rolls back on `Error` or an exception. They don't nest, and a nested call
-  raises rather than quietly committing the outer one.
+  rolls back on `Error` or an exception. Nested `transaction` calls use SQL
+  `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` so transactional helpers compose
+  cleanly.
 - **Errors.** `Qb.is_unique_violation e` and `Qb.violation e` say which
   constraint the database refused, whatever the driver.
 - **Conditions.** Besides the comparisons: `is_in`, `not_in`, `between`,
-  `like`, `ilike`, `is_null`, and for a nullable column against a plain
-  value, `>?`, `=?`, ... and `like_opt` (`Ops.(Books.pages >? 300)`).
+  `like`, `ilike`, `is_null`, `where_opt`, `all_of` / `any_of`, and for a
+  nullable column against a plain value, `>?`, `=?`, ... and `like_opt`
+  (`Ops.(Books.pages >? 300)`).
 
 ## Install
 
@@ -334,11 +387,14 @@ QB_TEST_PG_URL=postgresql://user:pass@localhost/db dune test --force
 
 ## Scope
 
-- The builder is for one table. Its two-table `join` is narrow on purpose
-  (one join, conditions and order on the left table, read only): use it when
-  a join's conditions are decided at run time or the database isn't
-  Postgres, and `[%sql]` for every other join.
-- `insert_returning` needs `RETURNING`, which MySQL lacks.
+- Use the single-table builder (`Qb.from`) for concise single-table CRUD and
+  changesets, [`Qb.Query` / `Qb.Expr` / `Qb.Rel`](doc/query.md) for composable
+  multi-table queries, aggregates, subqueries, CTEs, dynamic filters, and
+  batched eager loading across Postgres, SQLite, and MySQL, and `[%sql]` when
+  you prefer writing static Postgres SQL directly.
+- `insert_returning`, `update_returning`, `delete_returning`,
+  `update_from_returning`, and `delete_using_returning` need `RETURNING`, which
+  MySQL lacks.
 
 ## Contributing
 

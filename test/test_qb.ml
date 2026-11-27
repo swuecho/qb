@@ -321,7 +321,59 @@ let test_select () =
     (fun () -> ignore On_conflict.(do_update ~target:[ col Users.id ] ()));
   Alcotest.check_raises "upsert_many_sql empty"
     (Invalid_argument "Qb.upsert_many_sql: no rows") (fun () ->
-      ignore (upsert_many_sql (On_conflict.do_nothing ()) []))
+      ignore (upsert_many_sql (On_conflict.do_nothing ()) []));
+  (* where_opt, Ops.all_of, Ops.any_of *)
+  Alcotest.(check string)
+    "where_opt None is a no-op"
+    {|SELECT "id", "name", "age", "email" FROM "users"|}
+    (to_sql (from Users.table |> where_opt None));
+  Alcotest.(check string)
+    "where_opt + all_of + any_of"
+    {|SELECT "id", "name", "age", "email" FROM "users" WHERE (("age" >= ? AND "age" <= ?) AND ("name" = ? OR "name" = ?))|}
+    (to_sql
+       (from Users.table
+       |> where_opt (Ops.all_of Ops.[ Users.age >= 18; Users.age <= 65 ])
+       |> where_opt (Ops.any_of Ops.[ Users.name = "Ann"; Users.name = "Bob" ])
+       ));
+  Alcotest.(check bool) "all_of []" true (Ops.all_of [] = None);
+  Alcotest.(check bool) "any_of []" true (Ops.any_of [] = None);
+  (* Duplicate assignments keep the last value in first-seen column order. *)
+  Alcotest.(check string)
+    "dedup values assigns"
+    {|INSERT INTO "users" ("name", "age") VALUES (?, ?) RETURNING "id", "name", "age", "email"|}
+    (insert_values_sql
+       (values Users.table
+          Ops.[ Users.name := "A"; Users.age := 1; Users.name := "B" ]));
+  Alcotest.(check string)
+    "dedup update assigns"
+    {|UPDATE "users" SET "name" = ?, "age" = ? WHERE "id" = ?|}
+    (update_sql
+       Ops.[ Users.name := "A"; Users.age := 1; Users.name := "B" ]
+       (from Users.table |> where Ops.(Users.id = 1)));
+  Alcotest.(check string)
+    "dedup on_conflict set overrides excluded"
+    {|INSERT INTO "users" ("id", "name") VALUES (?, ?) ON CONFLICT ("id") DO UPDATE SET "name" = ? RETURNING "id", "name", "age", "email"|}
+    (upsert_sql
+       On_conflict.(
+         do_update
+           ~target:[ col Users.id; col Users.id ]
+           ~excluded:[ col Users.name ]
+           ~set:Ops.[ Users.name := "Fixed" ]
+           ())
+       (values Users.table Ops.[ Users.id := 1; Users.name := "Ann" ]));
+  (* Stmt placeholder validation for all statements *)
+  Alcotest.check_raises "stmt $2 out of bounds"
+    (Invalid_argument "Qb.Stmt (bad): $2 has no argument (1 given)") (fun () ->
+      ignore
+        (stmt_sql
+           (Stmt.make ~name:"bad" "SELECT $1, $2" [ Stmt.arg int 1 ] Stmt.unit)));
+  Alcotest.check_raises "stmt ? count mismatch"
+    (Invalid_argument
+       "Qb.Stmt (q): SQL has 2 ? placeholders but 1 argument was given")
+    (fun () ->
+      ignore
+        (stmt_sql
+           (Stmt.make ~name:"q" "SELECT ?, ?" [ Stmt.arg int 1 ] Stmt.unit)))
 
 let test_join_sql () =
   check_sql
@@ -936,25 +988,53 @@ let test_postgres_text db =
 
 let test_nested_transaction db =
   seed db;
-  (match
-     Blocking.transaction db (fun () ->
-         Blocking.transaction db (fun () -> Ok ()))
-   with
-  | exception Invalid_argument _ -> ()
-  | Ok () | Error _ -> Alcotest.fail "a nested transaction was allowed");
+  let add id name age =
+    ok
+      (Blocking.insert_values db
+         (values Users.table
+            Ops.[ Users.id := id; Users.name := name; Users.age := age ]))
+  in
+  (* Inner savepoint commits with the outer transaction. *)
+  ok
+    (Blocking.transaction db (fun () ->
+         let _ = add 4 "Outer" 40 in
+         Blocking.transaction db (fun () ->
+             let _ = add 5 "Inner" 20 in
+             Ok ())));
+  Alcotest.(check int)
+    "outer and inner both committed" 5
+    (List.length (all_users db));
+  (* Inner savepoint rolls back on Error (even after a DB error) without
+     aborting the outer transaction. *)
+  ok
+    (Blocking.transaction db (fun () ->
+         let _ = add 6 "Kept" 30 in
+         (match
+            Blocking.transaction db (fun () ->
+                let _ = add 7 "Undone" 10 in
+                (* Trigger a real DB error (duplicate PK) inside the savepoint. *)
+                Blocking.insert db Users.table ann)
+          with
+         | Error _ -> ()
+         | Ok () -> Alcotest.fail "inner duplicate insert should fail");
+         Ok ()));
+  let names = List.map (fun (u : Users.t) -> u.name) (all_users db) in
+  Alcotest.(check bool) "outer row kept" true (List.mem "Kept" names);
+  Alcotest.(check bool)
+    "inner savepoint rolled back" false (List.mem "Undone" names);
+  (* An uncaught exception unwinds both inner savepoint and outer transaction. *)
   (match
      Blocking.transaction db (fun () ->
          ignore (from Users.table |> where all_rows |> Blocking.delete db);
-         failwith "gave up")
+         Blocking.transaction db (fun () -> failwith "gave up"))
    with
   | exception Failure _ -> ()
   | Ok () | Error _ -> Alcotest.fail "the exception was lost");
-  Alcotest.(check int) "an exception rolls back" 3 (List.length (all_users db));
-  (* Either way the connection is out of its transaction, and usable. *)
+  Alcotest.(check int) "an exception rolls back" 6 (List.length (all_users db));
+  (* Connection is clean and usable afterwards. *)
   match Blocking.transaction db (fun () -> Ok ()) with
   | Ok () -> ()
   | Error e -> Alcotest.fail (Caqti_error.show e)
-  | exception Invalid_argument m -> Alcotest.fail m
 
 let test_types db =
   let at =
@@ -1281,7 +1361,25 @@ let test_validate () =
   Alcotest.(check int) "only the email changed" 1 (List.length (C.changes cs));
   Alcotest.(check (option int))
     "get falls back to the row" (Some 200) (C.get Users.age cs);
-  Alcotest.(check string) "input shows the value" "200" (C.input Users.age cs)
+  Alcotest.(check string) "input shows the value" "200" (C.input Users.age cs);
+  (* update_change and update_change_opt normalize before validation and drop
+     no-op changes on for_update. *)
+  let norm =
+    C.(
+      for_update Users.table ann
+      |> cast
+           [ ("name", " Ann "); ("email", "  NEW@X.ORG ") ]
+           [ field Users.name; field Users.email ]
+      |> update_change Users.name String.trim
+      |> update_change_opt Users.email (fun s ->
+          String.lowercase_ascii (String.trim s)))
+  in
+  Alcotest.(check (option string))
+    "trimmed name matches row, dropped as change" None
+    (C.get_change Users.name norm);
+  Alcotest.(check (option (option string)))
+    "normalized email kept" (Some (Some "new@x.org"))
+    (C.get_change Users.email norm)
 
 let create_signups ((module Db : DB) as db) =
   let sql =
@@ -1448,12 +1546,1733 @@ let test_concurrent_threads () =
   let threads = List.init 4 (fun i -> Thread.create worker i) in
   List.iter Thread.join threads
 
+(* ---------- multi-table query builder, expressions, CTEs, relations ---------- *)
+
+let test_multi_sql () =
+  (* 3-table join with left_join and self-join *)
+  let q3 =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* c =
+           join Comments.table ~on:(fun c ->
+               Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))
+         in
+         let* parent =
+           left_join Comments.table ~on:(fun p ->
+               Expr.Ops.(c.@(Comments.reply_to) =? p.@(Comments.id)))
+         in
+         let* () =
+           where
+             Expr.Ops.(
+               u.@(Users.age) >= Expr.int 18
+               && is_null parent.@??(Comments.reply_to))
+         in
+         let* () =
+           order_by [ desc c.@(Comments.id); nulls_last (asc u.@(Users.name)) ]
+         in
+         let* () = limit 10 in
+         let* () = offset 5 in
+         select
+           (let+ uname = expr u.@(Users.name)
+            and+ body = expr c.@(Comments.body)
+            and+ pbody = expr parent.@?(Comments.body) in
+            (uname, body, pbody))))
+  in
+  Alcotest.(check string)
+    "3-table join postgres"
+    {|SELECT "t0"."name", "t1"."body", "t2"."body" FROM "users" AS "t0" INNER JOIN "comments" AS "t1" ON "t1"."author_id" = "t0"."id" LEFT JOIN "comments" AS "t2" ON "t1"."reply_to" = "t2"."id" WHERE ("t0"."age" >= ? AND "t2"."reply_to" IS NULL) ORDER BY "t1"."id" DESC, "t0"."name" ASC NULLS LAST LIMIT 10 OFFSET 5|}
+    (Query.to_sql ~dialect:Postgres q3);
+  (* Dialect differences: concat, length, sum, avg, lock *)
+  let q_exprs =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () = group_by [ Expr.any u.@(Users.name) ] in
+         let* () = having Expr.Ops.(Expr.count_all > Expr.int 1) in
+         let* () = for_update ~skip_locked:true () in
+         select
+           (let+ label =
+              expr Expr.Ops.(Expr.lower u.@(Users.name) ^ Expr.text "!")
+            and+ len = expr (Expr.length u.@(Users.name))
+            and+ total_age = expr (Expr.sum_int u.@(Users.age))
+            and+ avg_age = expr (Expr.avg u.@(Users.age)) in
+            (label, len, total_age, avg_age))))
+  in
+  Alcotest.(check string)
+    "exprs postgres"
+    {|SELECT (LOWER("t0"."name") || ?), CHAR_LENGTH("t0"."name"), CAST(SUM("t0"."age") AS BIGINT), CAST(AVG("t0"."age") AS DOUBLE PRECISION) FROM "users" AS "t0" GROUP BY "t0"."name" HAVING COUNT(*) > ? FOR UPDATE SKIP LOCKED|}
+    (Query.to_sql ~dialect:Postgres q_exprs);
+  Alcotest.(check string)
+    "exprs mysql"
+    {|SELECT CONCAT(LOWER(`t0`.`name`), ?), CHAR_LENGTH(`t0`.`name`), SUM(`t0`.`age`), CAST(AVG(`t0`.`age`) AS DOUBLE) FROM `users` AS `t0` GROUP BY `t0`.`name` HAVING COUNT(*) > ? FOR UPDATE SKIP LOCKED|}
+    (Query.to_sql ~dialect:Mysql q_exprs);
+  Alcotest.(check string)
+    "exprs sqlite"
+    {|SELECT (LOWER("t0"."name") || ?), LENGTH("t0"."name"), SUM("t0"."age"), CAST(AVG("t0"."age") AS REAL) FROM "users" AS "t0" GROUP BY "t0"."name" HAVING COUNT(*) > ?|}
+    (Query.to_sql ~dialect:Sqlite q_exprs);
+  Alcotest.(check string)
+    "grouped count wraps subquery and strips FOR UPDATE"
+    {|SELECT COUNT(*) FROM (SELECT (LOWER("t0"."name") || ?), CHAR_LENGTH("t0"."name"), CAST(SUM("t0"."age") AS BIGINT), CAST(AVG("t0"."age") AS DOUBLE PRECISION) FROM "users" AS "t0" GROUP BY "t0"."name" HAVING COUNT(*) > ?) AS "_qb_count"|}
+    (Query.count_sql ~dialect:Postgres q_exprs);
+  (* right_join & full_join rebind left handle as nullable *)
+  let q_right =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* u, c =
+           right_join u Comments.table ~on:(fun c ->
+               Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))
+         in
+         select
+           (let+ uname = expr u.@?(Users.name)
+            and+ body = expr c.@(Comments.body) in
+            (uname, body))))
+  in
+  Alcotest.(check string)
+    "right_join sql"
+    {|SELECT "t0"."name", "t1"."body" FROM "users" AS "t0" RIGHT JOIN "comments" AS "t1" ON "t1"."author_id" = "t0"."id"|}
+    (Query.to_sql ~dialect:Postgres q_right);
+  let q_full =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* u, c =
+           full_join u Comments.table ~on:(fun c ->
+               Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))
+         in
+         select
+           (let+ uname = expr u.@?(Users.name)
+            and+ body = expr c.@?(Comments.body) in
+            (uname, body))))
+  in
+  Alcotest.(check string)
+    "full_join sql"
+    {|SELECT "t0"."name", "t1"."body" FROM "users" AS "t0" FULL JOIN "comments" AS "t1" ON "t1"."author_id" = "t0"."id"|}
+    (Query.to_sql ~dialect:Postgres q_full);
+  (* CTE + derived table *)
+  let q_cte =
+    Query.(
+      build
+        (let* stats, (author_id, total) =
+           with_cte "comment_stats"
+             (let* c = from Comments.table in
+              let* () = group_by [ Expr.any c.@(Comments.author_id) ] in
+              select_named
+                Named.(
+                  let+ aid = field "author_id" c.@(Comments.author_id)
+                  and+ cnt = field "total" Expr.count_all in
+                  (aid, cnt)))
+         in
+         let* u = from Users.table in
+         let* s =
+           left_join_cte stats ~on:(fun s ->
+               Expr.Ops.(s.@(author_id) = u.@(Users.id)))
+         in
+         select
+           (let+ name = expr u.@(Users.name)
+            and+ total = expr (Expr.coalesce s.@?(total) (Expr.int 0)) in
+            (name, total))))
+  in
+  Alcotest.(check string)
+    "cte sql"
+    {|WITH "comment_stats" AS (SELECT "t2"."author_id" AS "author_id", COUNT(*) AS "total" FROM "comments" AS "t2" GROUP BY "t2"."author_id") SELECT "t0"."name", COALESCE("t1"."total", ?) FROM "users" AS "t0" LEFT JOIN "comment_stats" AS "t1" ON "t1"."author_id" = "t0"."id"|}
+    (Query.to_sql ~dialect:Postgres q_cte);
+  (* Correlated EXISTS *)
+  let q_exists =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () =
+           where
+             (exists
+                (sub
+                   (let* c = from Comments.table in
+                    where Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))))
+         in
+         select (expr u.@(Users.name))))
+  in
+  Alcotest.(check string)
+    "correlated exists"
+    {|SELECT "t0"."name" FROM "users" AS "t0" WHERE EXISTS (SELECT 1 FROM "comments" AS "t1" WHERE "t1"."author_id" = "t0"."id")|}
+    (Query.to_sql ~dialect:Postgres q_exists);
+  (* Expression update and upsert *)
+  let upd_sql =
+    from Users.table
+    |> where Ops.(Users.id = 1)
+    |> update_sql
+         [
+           set_expr Users.age Expr.Ops.(Expr.col Users.age + Expr.int 1);
+           set_expr Users.name (Expr.trim (Expr.col Users.name));
+         ]
+  in
+  Alcotest.(check string)
+    "set_expr update"
+    {|UPDATE "users" SET "age" = ("age" + ?), "name" = TRIM("name") WHERE "id" = ?|}
+    upd_sql;
+  let ups_sql =
+    upsert_sql
+      On_conflict.(
+        do_update
+          ~target:[ col Users.id ]
+          ~set:
+            [
+              set_expr Users.age
+                Expr.Ops.(Expr.col Users.age + Expr.excluded Users.age);
+            ]
+          ())
+      (values Users.table
+         Ops.[ Users.id := 1; Users.name := "Ann"; Users.age := 5 ])
+  in
+  Alcotest.(check string)
+    "set_expr upsert"
+    {|INSERT INTO "users" ("id", "name", "age") VALUES (?, ?, ?) ON CONFLICT ("id") DO UPDATE SET "age" = ("users"."age" + EXCLUDED."age") RETURNING "id", "name", "age", "email"|}
+    ups_sql;
+  (* Multi-table update_from & delete_using *)
+  let upd_from =
+    Query.(
+      update_from Users.table (fun u ->
+          let* c = from Comments.table in
+          let* () =
+            where
+              Expr.Ops.(
+                c.@(Comments.author_id) = u.@(Users.id)
+                && c.@(Comments.body) = Expr.text "promote")
+          in
+          return [ set Users.age Expr.Ops.(u.@(Users.age) + Expr.int 1) ]))
+  in
+  Alcotest.(check string)
+    "update_from sql"
+    {|UPDATE "users" AS "t0" SET "age" = ("t0"."age" + ?) FROM "comments" AS "t1" WHERE ("t1"."author_id" = "t0"."id" AND "t1"."body" = ?)|}
+    (Query.update_from_sql ~dialect:Postgres upd_from);
+  let del_using =
+    Query.(
+      delete_using Comments.table (fun c ->
+          let* u = from Users.table in
+          where
+            Expr.Ops.(
+              u.@(Users.id) = c.@(Comments.author_id)
+              && u.@(Users.age) < Expr.int 18)))
+  in
+  Alcotest.(check string)
+    "delete_using sql"
+    {|DELETE FROM "comments" AS "t0" USING "users" AS "t1" WHERE ("t1"."id" = "t0"."author_id" AND "t1"."age" < ?)|}
+    (Query.delete_using_sql ~dialect:Postgres del_using);
+  Alcotest.check_raises "update_from requires where"
+    (Invalid_argument
+       "Qb.Query.update_from: missing where (pass ~all_rows:true to update \
+        every row)") (fun () ->
+      ignore
+        (Query.update_from Users.table (fun _ ->
+             Query.return [ Query.set_val Users.age 0 ])));
+  Alcotest.check_raises "delete_using requires where"
+    (Invalid_argument
+       "Qb.Query.delete_using: missing where (pass ~all_rows:true to delete \
+        every row)") (fun () ->
+      ignore (Query.delete_using Users.table (fun _ -> Query.return ())))
+
+let test_multi_db db =
+  ok
+    (Blocking.insert_many db Users.table
+       [
+         { id = 1; name = "Ann"; age = 34; email = Some "ann@x.org" };
+         { id = 2; name = "Bob"; age = 51; email = None };
+         { id = 3; name = "Cy"; age = 17; email = None };
+       ]);
+  ok
+    (Blocking.insert_many db Comments.table
+       [
+         { id = 10; author_id = 1; body = "hello"; reply_to = None };
+         { id = 11; author_id = 2; body = "hi ann"; reply_to = Some 10 };
+         { id = 12; author_id = 2; body = "follow up"; reply_to = Some 11 };
+       ]);
+  (* 1. 3-table join (Users -> Comments -> parent Comment -> parent Author = 4 tables!) *)
+  let q_thread =
+    Query.(
+      build
+        (let* c = from Comments.table in
+         let* author =
+           join Users.table ~on:(fun u ->
+               Expr.Ops.(u.@(Users.id) = c.@(Comments.author_id)))
+         in
+         let* parent =
+           left_join Comments.table ~on:(fun p ->
+               Expr.Ops.(c.@(Comments.reply_to) =? p.@(Comments.id)))
+         in
+         let* parent_author =
+           left_join Users.table ~on:(fun pu ->
+               Expr.Ops.(parent.@?(Comments.author_id) =? pu.@(Users.id)))
+         in
+         let* () = order_by [ asc c.@(Comments.id) ] in
+         select
+           (let+ cid = expr c.@(Comments.id)
+            and+ author_name = expr author.@(Users.name)
+            and+ parent_body = expr parent.@?(Comments.body)
+            and+ parent_author_name = expr parent_author.@?(Users.name) in
+            (cid, author_name, parent_body, parent_author_name))))
+  in
+  let thread = ok (Blocking.query_all db q_thread) in
+  Alcotest.(
+    check (list (pair (pair int string) (pair (option string) (option string)))))
+    "4-table join thread"
+    [
+      ((10, "Ann"), (None, None));
+      ((11, "Bob"), (Some "hello", Some "Ann"));
+      ((12, "Bob"), (Some "hi ann", Some "Bob"));
+    ]
+    (List.map (fun (a, b, c, d) -> ((a, b), (c, d))) thread);
+
+  (* 2. Anti-join: users with no comments *)
+  let no_comments =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* c =
+           left_join Comments.table ~on:(fun c ->
+               Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))
+         in
+         let* () = where Expr.Ops.(is_null c.@?(Comments.id)) in
+         select (expr u.@(Users.name))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list string)) "anti-join" [ "Cy" ] no_comments;
+
+  (* 3. GROUP BY + HAVING + aggregates + query_count *)
+  let q_stats =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* c =
+           left_join Comments.table ~on:(fun c ->
+               Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))
+         in
+         let* () =
+           group_by [ Expr.any u.@(Users.id); Expr.any u.@(Users.name) ]
+         in
+         let* () =
+           having Expr.Ops.(Expr.count c.@?(Comments.id) >= Expr.int 1)
+         in
+         let* () =
+           order_by [ desc (Expr.count c.@?(Comments.id)); asc u.@(Users.name) ]
+         in
+         select
+           (let+ name = expr u.@(Users.name)
+            and+ cnt = expr (Expr.count c.@?(Comments.id)) in
+            (name, cnt))))
+  in
+  Alcotest.(check (list (pair string int)))
+    "group by + having"
+    [ ("Bob", 2); ("Ann", 1) ]
+    (ok (Blocking.query_all db q_stats));
+  Alcotest.(check int)
+    "grouped query_count" 2
+    (ok (Blocking.query_count db q_stats));
+
+  (* 4. Aggregates without group by (SUM, AVG, MIN, MAX, CASE, COALESCE, Raw) *)
+  let q_agg =
+    Query.(
+      build
+        (let* u = from Users.table in
+         select
+           (let+ total_age = expr (Expr.sum_int u.@(Users.age))
+            and+ min_age = expr (Expr.min u.@(Users.age))
+            and+ max_age = expr (Expr.max u.@(Users.age)) in
+            (total_age, min_age, max_age))))
+  in
+  let total_age, min_age, max_age = ok (Blocking.query_one db q_agg) in
+  Alcotest.(check (option int)) "sum" (Some 102) total_age;
+  Alcotest.(check (option int)) "min" (Some 17) min_age;
+  Alcotest.(check (option int)) "max" (Some 51) max_age;
+
+  let q_case_raw =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () =
+           where
+             (Raw.bool
+                [ Raw.expr u.@(Users.age); Raw.sql " >= "; Raw.param int 18 ])
+         in
+         let* () = order_by [ asc u.@(Users.id) ] in
+         let tier =
+           Expr.case_when
+             [ (Expr.Ops.(u.@(Users.age) >= Expr.int 50), Expr.text "senior") ]
+             ~else_:(Expr.text "adult")
+         in
+         select
+           (let+ label =
+              expr
+                (Expr.coalesce u.@(Users.email)
+                   Expr.Ops.(Expr.lower u.@(Users.name) ^ Expr.text "@local"))
+            and+ tier = expr tier in
+            (label, tier))))
+  in
+  Alcotest.(check (list (pair string string)))
+    "case + coalesce + raw"
+    [ ("ann@x.org", "adult"); ("bob@local", "senior") ]
+    (ok (Blocking.query_all db q_case_raw));
+
+  (* 5. Correlated EXISTS, IN subquery, scalar subquery *)
+  let active_names =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () =
+           where
+             (exists
+                (sub
+                   (let* c = from Comments.table in
+                    where Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))))
+         in
+         let* () = order_by [ asc u.@(Users.name) ] in
+         select (expr u.@(Users.name))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list string))
+    "correlated exists" [ "Ann"; "Bob" ] active_names;
+
+  let commenters_by_in =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () =
+           where
+             (in_query u.@(Users.id)
+                (build
+                   (let* c = from Comments.table in
+                    select_one c.@(Comments.author_id))))
+         in
+         let* () = order_by [ asc u.@(Users.id) ] in
+         select (expr u.@(Users.name))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list string)) "in_query" [ "Ann"; "Bob" ] commenters_by_in;
+
+  let with_scalar_cnt =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () = order_by [ asc u.@(Users.id) ] in
+         let cnt_sub =
+           build
+             (let* c = from Comments.table in
+              let* () =
+                where Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id))
+              in
+              select_one Expr.count_all)
+         in
+         select
+           (let+ name = expr u.@(Users.name)
+            and+ cnt = expr (Expr.coalesce (scalar cnt_sub) (Expr.int 0)) in
+            (name, cnt))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair string int)))
+    "scalar subquery"
+    [ ("Ann", 1); ("Bob", 2); ("Cy", 0) ]
+    with_scalar_cnt;
+
+  (* 6. CTE + derived table *)
+  let cte_rows =
+    Query.(
+      build
+        (let* stats, (author_id, cnt) =
+           with_cte "author_counts"
+             (let* c = from Comments.table in
+              let* () = group_by [ Expr.any c.@(Comments.author_id) ] in
+              select_named
+                Named.(
+                  let+ aid = field "author_id" c.@(Comments.author_id)
+                  and+ cnt = field "cnt" Expr.count_all in
+                  (aid, cnt)))
+         in
+         let* u = from Users.table in
+         let* s =
+           left_join_cte stats ~on:(fun s ->
+               Expr.Ops.(s.@(author_id) = u.@(Users.id)))
+         in
+         let* () = order_by [ asc u.@(Users.id) ] in
+         select
+           (let+ name = expr u.@(Users.name)
+            and+ n = expr (Expr.coalesce s.@?(cnt) (Expr.int 0)) in
+            (name, n))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair string int)))
+    "cte left join"
+    [ ("Ann", 1); ("Bob", 2); ("Cy", 0) ]
+    cte_rows;
+
+  let derived_rows =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* s, (_aid, cnt) =
+           left_join_subquery
+             (let* c = from Comments.table in
+              let* () = group_by [ Expr.any c.@(Comments.author_id) ] in
+              select_named
+                Named.(
+                  let+ aid = field "author_id" c.@(Comments.author_id)
+                  and+ cnt = field "cnt" Expr.count_all in
+                  (aid, cnt)))
+             ~on:(fun s (aid, _) -> Expr.Ops.(s.@(aid) = u.@(Users.id)))
+         in
+         let* () = order_by [ asc u.@(Users.id) ] in
+         select
+           (let+ name = expr u.@(Users.name)
+            and+ n = expr (Expr.coalesce s.@?(cnt) (Expr.int 0)) in
+            (name, n))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair string int)))
+    "derived table left join"
+    [ ("Ann", 1); ("Bob", 2); ("Cy", 0) ]
+    derived_rows;
+
+  (* 7. UNION / EXCEPT *)
+  let adults =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () = where Expr.Ops.(u.@(Users.age) >= Expr.int 30) in
+         select (expr u.@(Users.name))))
+  in
+  let young =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () = where Expr.Ops.(u.@(Users.age) < Expr.int 20) in
+         select (expr u.@(Users.name))))
+  in
+  let combined =
+    Query.union adults young |> Blocking.query_all db |> ok |> List.sort compare
+  in
+  Alcotest.(check (list string)) "union" [ "Ann"; "Bob"; "Cy" ] combined;
+
+  (* UNION of two CTE queries works on both Postgres and SQLite *)
+  let cte_a =
+    Query.(
+      build
+        (let* a, name_col =
+           with_cte "a"
+             (let* u = from Users.table in
+              let* () = where Expr.Ops.(u.@(Users.age) >= Expr.int 50) in
+              select_named (field "name" u.@(Users.name)))
+         in
+         let* r = from_cte a in
+         select (expr r.@(name_col))))
+  in
+  let cte_b =
+    Query.(
+      build
+        (let* b, name_col =
+           with_cte "b"
+             (let* u = from Users.table in
+              let* () = where Expr.Ops.(u.@(Users.age) < Expr.int 20) in
+              select_named (field "name" u.@(Users.name)))
+         in
+         let* r = from_cte b in
+         select (expr r.@(name_col))))
+  in
+  let cte_union =
+    Query.union cte_a cte_b |> Blocking.query_all db |> ok |> List.sort compare
+  in
+  Alcotest.(check (list string)) "union of CTEs" [ "Bob"; "Cy" ] cte_union;
+
+  (* FULL JOIN returns NULL on unmatched side cleanly through opt_ref *)
+  let full_rows =
+    Query.(
+      build
+        (let* c = from Comments.table in
+         let* c, u =
+           full_join c Users.table ~on:(fun u ->
+               Expr.Ops.(u.@(Users.id) = c.@(Comments.author_id)))
+         in
+         let* () =
+           order_by
+             [
+               nulls_last (asc u.@?(Users.id));
+               nulls_last (asc c.@?(Comments.id));
+             ]
+         in
+         select
+           (let+ uname = expr u.@?(Users.name)
+            and+ body = expr c.@?(Comments.body) in
+            (uname, body))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair (option string) (option string))))
+    "full_join with unmatched user"
+    [
+      (Some "Ann", Some "hello");
+      (Some "Bob", Some "hi ann");
+      (Some "Bob", Some "follow up");
+      (Some "Cy", None);
+    ]
+    full_rows;
+
+  (* 8. Expression update + upsert with EXCLUDED + update_from + insert_select *)
+  ok
+    (from Users.table
+    |> where Ops.(Users.id = 1)
+    |> Blocking.update db
+         [ set_expr Users.age Expr.Ops.(Expr.col Users.age + Expr.int 1) ]);
+  let ann =
+    ok (from Users.table |> where Ops.(Users.id = 1) |> Blocking.first db)
+    |> Option.get
+  in
+  Alcotest.(check int) "set_expr incremented age" 35 ann.age;
+
+  let bumped =
+    ok
+      (Blocking.upsert db
+         On_conflict.(
+           do_update
+             ~target:[ col Users.id ]
+             ~set:
+               [
+                 set_expr Users.age
+                   Expr.Ops.(Expr.col Users.age + Expr.excluded Users.age);
+               ]
+             ())
+         (values Users.table
+            Ops.[ Users.id := 1; Users.name := "Ann"; Users.age := 5 ]))
+    |> Option.get
+  in
+  Alcotest.(check int) "upsert excluded expr" 40 bumped.age;
+
+  (* update_from: bump age of every user who has at least one comment *)
+  let changed =
+    Query.(
+      update_from Users.table (fun u ->
+          let* () =
+            where
+              (exists
+                 (sub
+                    (let* c = from Comments.table in
+                     where Expr.Ops.(c.@(Comments.author_id) = u.@(Users.id)))))
+          in
+          return [ set Users.age Expr.Ops.(u.@(Users.age) + Expr.int 10) ]))
+    |> Blocking.update_from_count db
+    |> ok
+  in
+  Alcotest.(check int) "update_from count" 2 changed;
+  let ages =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () = order_by [ asc u.@(Users.id) ] in
+         select
+           (let+ name = expr u.@(Users.name) and+ age = expr u.@(Users.age) in
+            (name, age))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair string int)))
+    "ages after update_from"
+    [ ("Ann", 50); ("Bob", 61); ("Cy", 17) ]
+    ages;
+
+  (* insert_select: insert into Signups from Users *)
+  ok (Blocking.create_table db Signups.table);
+  let src =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () = where Expr.Ops.(u.@(Users.age) >= Expr.int 50) in
+         select
+           (let+ email =
+              expr (Expr.coalesce u.@(Users.email) (Expr.text "none@x.org"))
+            and+ age = expr u.@(Users.age) in
+            Row.[ email; age ])))
+  in
+  ok
+    (Blocking.insert_select db Signups.table [ Signups.email; Signups.age ] src);
+  Alcotest.(check int)
+    "insert_select copied 2 rows" 2
+    (ok (from Signups.table |> Blocking.count db));
+
+  (* 9. Recursive CTE: walk threaded comments from root id=10 with depth *)
+  let thread_depths =
+    Query.(
+      build
+        (let* tree, (cid, depth) =
+           with_recursive_cte "thread"
+             ~base:
+               (let* c = from Comments.table in
+                let* () = where Expr.Ops.(c.@(Comments.id) = Expr.int 10) in
+                select_named
+                  Named.(
+                    let+ cid = field "id" c.@(Comments.id)
+                    and+ depth = field "depth" (Expr.int 0) in
+                    (cid, depth)))
+             ~step:(fun self (cid, depth) ->
+               let* p = from_cte self in
+               let* c =
+                 join Comments.table ~on:(fun c ->
+                     Expr.Ops.(c.@(Comments.reply_to) =? p.@(cid)))
+               in
+               select_named
+                 Named.(
+                   let+ cid = field "id" c.@(Comments.id)
+                   and+ depth =
+                     field "depth" Expr.Ops.(p.@(depth) + Expr.int 1)
+                   in
+                   (cid, depth)))
+         in
+         let* t = from_cte tree in
+         let* () = order_by [ asc t.@(depth); asc t.@(cid) ] in
+         select
+           (let+ id = expr t.@(cid) and+ d = expr t.@(depth) in
+            (id, d))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair int int)))
+    "recursive CTE comment thread depths"
+    [ (10, 0); (11, 1); (12, 2) ]
+    thread_depths;
+
+  (* 10. Dynamic clauses (when_ / opt) + update_from_returning / delete_using_returning *)
+  let search ?min_age ?(only_with_email = false) () =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () =
+           opt min_age (fun a -> where Expr.Ops.(u.@(Users.age) >= Expr.int a))
+         in
+         let* () =
+           when_ only_with_email (fun () ->
+               where Expr.Ops.(is_not_null u.@(Users.email)))
+         in
+         let* () = order_by [ asc u.@(Users.id) ] in
+         select (expr u.@(Users.name))))
+  in
+  Alcotest.(check (list string))
+    "dynamic opt + when_" [ "Ann" ]
+    (ok (Blocking.query_all db (search ~min_age:20 ~only_with_email:true ())));
+  let updated_names =
+    Query.(
+      update_from Users.table (fun u ->
+          let* () = where Expr.Ops.(u.@(Users.id) = Expr.int 3) in
+          return [ set Users.age Expr.Ops.(u.@(Users.age) + Expr.int 1) ]))
+    |> fun p ->
+    ok (Blocking.update_from_returning db p [ Users.name; Users.age ])
+    |> List.map (fun Row.[ name; age ] -> (name, age))
+  in
+  Alcotest.(check (list (pair string int)))
+    "update_from_returning"
+    [ ("Cy", 18) ]
+    updated_names;
+  let deleted_ids =
+    Query.(
+      delete_using Comments.table (fun c ->
+          where
+            (exists
+               (sub
+                  (let* u = from Users.table in
+                   where
+                     Expr.Ops.(
+                       u.@(Users.id) = c.@(Comments.author_id)
+                       && u.@(Users.name) = Expr.text "Ann"))))))
+    |> fun p -> ok (Blocking.delete_using_returning db p (col Comments.id))
+  in
+  Alcotest.(check (list int)) "delete_using_returning" [ 10 ] deleted_ids;
+
+  (* 11. Window functions (row_number, lag, running sum OVER) + FILTER + Keyset + JSON *)
+  let window_rows =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () = order_by [ asc u.@(Users.id) ] in
+         let rn = Expr.row_number ~order_by:[ asc u.@(Users.id) ] () in
+         let prev_name =
+           Expr.lag ~order_by:[ asc u.@(Users.id) ] u.@(Users.name)
+         in
+         let running_age =
+           Expr.sum_int u.@(Users.age)
+           |> Expr.over ~order_by:[ asc u.@(Users.id) ]
+         in
+         select
+           (let+ name = expr u.@(Users.name)
+            and+ rn = expr rn
+            and+ prev = expr prev_name
+            and+ run = expr running_age in
+            ((name, rn), (prev, run)))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(
+    check (list (pair (pair string int) (pair (option string) (option int)))))
+    "window functions"
+    [
+      (("Ann", 1), (None, Some 50));
+      (("Bob", 2), (Some "Ann", Some 111));
+      (("Cy", 3), (Some "Bob", Some 129));
+    ]
+    window_rows;
+
+  (* Top-1-per-group via CTE + row_number *)
+  let latest_per_author =
+    Query.(
+      build
+        (let* ranked, (aid, body, rn) =
+           with_cte "ranked"
+             (let* c = from Comments.table in
+              select_named
+                Named.(
+                  let+ aid = field "author_id" c.@(Comments.author_id)
+                  and+ body = field "body" c.@(Comments.body)
+                  and+ rn =
+                    field "rn"
+                      (Expr.row_number
+                         ~partition_by:[ Expr.any c.@(Comments.author_id) ]
+                         ~order_by:[ desc c.@(Comments.id) ]
+                         ())
+                  in
+                  (aid, body, rn)))
+         in
+         let* r = from_cte ranked in
+         let* () = where Expr.Ops.(r.@(rn) = Expr.int 1) in
+         let* () = order_by [ asc r.@(aid) ] in
+         select
+           (let+ a = expr r.@(aid) and+ b = expr r.@(body) in
+            (a, b))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair int string)))
+    "top-1 per group via row_number"
+    [ (2, "follow up") ]
+    latest_per_author;
+
+  (* Aggregate FILTER (WHERE ...) *)
+  let total_cnt, senior_cnt, senior_age_sum =
+    Query.(
+      build
+        (let* u = from Users.table in
+         select
+           (let+ total = expr Expr.count_all
+            and+ seniors =
+              expr
+                (Expr.count_all
+                |> Expr.filter Expr.Ops.(u.@(Users.age) >= Expr.int 50))
+            and+ senior_sum =
+              expr
+                (Expr.sum_int u.@(Users.age)
+                |> Expr.filter Expr.Ops.(u.@(Users.age) >= Expr.int 50))
+            in
+            (total, seniors, senior_sum))))
+    |> Blocking.query_one db |> ok
+  in
+  Alcotest.(check (triple int int (option int)))
+    "aggregate FILTER" (3, 2, Some 111)
+    (total_cnt, senior_cnt, senior_age_sum);
+
+  (* Keyset / cursor pagination (tuple comparison) *)
+  let after_bob =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* () =
+           where
+             Expr.Keyset.(
+               lt2 (u.@(Users.age), u.@(Users.id)) (Expr.int 61, Expr.int 2))
+         in
+         let* () = order_by [ desc u.@(Users.age); desc u.@(Users.id) ] in
+         select (expr u.@(Users.name))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list string)) "keyset lt2" [ "Ann"; "Cy" ] after_bob;
+
+  (* JSON ->> extraction on SQLite & Postgres *)
+  let now = Ptime.of_float_s 1_700_000_000. |> Option.get in
+  ok
+    (Blocking.insert db Things.table
+       {
+         id = 1;
+         big = 1L;
+         ratio = 1.0;
+         flag = true;
+         blob = "b";
+         at = now;
+         day = now;
+         uid = "00000000-0000-0000-0000-000000000001";
+         doc = {|{"role":"admin","level":3}|};
+       });
+  let role =
+    Query.(
+      build
+        (let* t = from Things.table in
+         select (expr (Expr.Json.get_text t.@(Things.doc) (Expr.text "role")))))
+    |> Blocking.query_one db |> ok
+  in
+  Alcotest.(check (option string)) "json get_text" (Some "admin") role;
+
+  (* 12. Qb.Q one-stop DSL: value ops (=., >=., =?.), &>, select1..4, paginate,
+     debug, named, and query_exists *)
+  let dsl_q =
+    Q.(
+      build ~name:"adult_emails"
+        (let* u = from Users.table in
+         where (u.@(Users.age) >=. 18 && u.@(Users.email) =?. "ann@x.org")
+         &> order_by [ asc u.@(Users.id) ]
+         &> paginate ~page:1 ~per_page:10
+         &> select2 u.@(Users.name) u.@(Users.age)))
+  in
+  Alcotest.(check (option string))
+    "query name" (Some "adult_emails") (Q.name dsl_q);
+  Alcotest.(check string)
+    "query debug shows name and bound params"
+    {|[adult_emails] SELECT "t0"."name", "t0"."age" FROM "users" AS "t0" WHERE ("t0"."age" >= ? AND "t0"."email" = ?) ORDER BY "t0"."id" ASC LIMIT 10 OFFSET 0 [18, "ann@x.org"]|}
+    (Q.debug ~dialect:Postgres dsl_q);
+  Alcotest.(check (list (pair string int)))
+    "Qb.Q query_all"
+    [ ("Ann", 50) ]
+    (ok (Blocking.query_all db dsl_q));
+  Alcotest.(check bool)
+    "query_exists true" true
+    (ok (Blocking.query_exists db dsl_q));
+  let missing_q =
+    Q.(
+      build
+        (let* u = from Users.table in
+         where (u.@(Users.name) =. "Nobody") &> select1 u.@(Users.id)))
+  in
+  Alcotest.(check bool)
+    "query_exists false" false
+    (ok (Blocking.query_exists db missing_q));
+  let page2 =
+    Q.(
+      build
+        (let* u = from Users.table in
+         order_by [ asc u.@(Users.id) ]
+         &> paginate ~page:2 ~per_page:2
+         &> select1 u.@(Users.name)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list string)) "paginate page 2" [ "Cy" ] page2;
+  (* =. None renders IS NULL *)
+  let null_email_names =
+    Q.(
+      build
+        (let* u = from Users.table in
+         where (u.@(Users.email) =. None)
+         &> order_by [ asc u.@(Users.id) ]
+         &> select1 u.@(Users.name)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list string))
+    "=. None matches NULL" [ "Bob"; "Cy" ] null_email_names
+
+let test_relations_db db =
+  ok
+    (Blocking.insert_many db Users.table
+       [
+         { id = 1; name = "Ann"; age = 34; email = Some "ann@x.org" };
+         { id = 2; name = "Bob"; age = 51; email = None };
+         { id = 3; name = "Cy"; age = 17; email = None };
+       ]);
+  ok
+    (Blocking.insert_many db Comments.table
+       [
+         { id = 10; author_id = 1; body = "first"; reply_to = None };
+         { id = 11; author_id = 2; body = "second"; reply_to = Some 10 };
+         { id = 12; author_id = 2; body = "third"; reply_to = Some 10 };
+       ]);
+  let user_comments =
+    Rel.has_many ~parent_key:Users.id ~child:Comments.table
+      ~child_key:Comments.author_id
+  in
+  let comment_author =
+    Rel.belongs_to ~child_key:Comments.author_id ~parent:Users.table
+      ~parent_key:Users.id
+  in
+  let comment_parent =
+    Rel.belongs_to_opt ~child_key:Comments.reply_to ~parent:Comments.table
+      ~parent_key:Comments.id
+  in
+  let comment_replies =
+    Rel.has_many_opt ~parent_key:Comments.id ~child:Comments.table
+      ~child_key:Comments.reply_to
+  in
+  (* Relation-driven join in Qb.Query *)
+  let joined =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* c = left_join_many u user_comments in
+         let* () =
+           order_by [ asc u.@(Users.id); nulls_last (asc c.@?(Comments.id)) ]
+         in
+         select
+           (let+ name = expr u.@(Users.name)
+            and+ body = expr c.@?(Comments.body) in
+            (name, body))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair string (option string))))
+    "left_join_many"
+    [
+      ("Ann", Some "first");
+      ("Bob", Some "second");
+      ("Bob", Some "third");
+      ("Cy", None);
+    ]
+    joined;
+  (* Batched eager loading: load_many *)
+  let users =
+    ok (from Users.table |> order_by [ asc Users.id ] |> Blocking.all db)
+  in
+  let loaded =
+    ok
+      (Blocking.load_many db user_comments users ~order_by:[ desc Comments.id ])
+  in
+  Alcotest.(check (list (pair string (list string))))
+    "load_many ordered"
+    [ ("Ann", [ "first" ]); ("Bob", [ "third"; "second" ]); ("Cy", []) ]
+    (List.map
+       (fun ((u : Users.t), cs) ->
+         (u.name, List.map (fun (c : Comments.t) -> c.body) cs))
+       loaded);
+  Alcotest.(check int)
+    "load_many empty" 0
+    (List.length (ok (Blocking.load_many db user_comments [])));
+  (* Batched eager loading: load_one + nullable FK belongs_to_opt + has_many_opt *)
+  let comments =
+    ok (from Comments.table |> order_by [ asc Comments.id ] |> Blocking.all db)
+  in
+  let with_authors = ok (Blocking.load_one db comment_author comments) in
+  Alcotest.(check (list (pair int (option string))))
+    "load_one belongs_to"
+    [ (10, Some "Ann"); (11, Some "Bob"); (12, Some "Bob") ]
+    (List.map
+       (fun ((c : Comments.t), u) ->
+         (c.id, Option.map (fun (u : Users.t) -> u.name) u))
+       with_authors);
+  let with_parents = ok (Blocking.load_one db comment_parent comments) in
+  Alcotest.(check (list (pair int (option string))))
+    "load_one belongs_to_opt"
+    [ (10, None); (11, Some "first"); (12, Some "first") ]
+    (List.map
+       (fun ((c : Comments.t), p) ->
+         (c.id, Option.map (fun (p : Comments.t) -> p.body) p))
+       with_parents);
+  let with_replies =
+    ok
+      (Blocking.load_many db comment_replies comments
+         ~order_by:[ asc Comments.id ])
+  in
+  Alcotest.(check (list (pair int (list int))))
+    "load_many has_many_opt"
+    [ (10, [ 11; 12 ]); (11, []); (12, []) ]
+    (List.map
+       (fun ((c : Comments.t), rs) ->
+         (c.id, List.map (fun (r : Comments.t) -> r.id) rs))
+       with_replies);
+
+  (* 3-level nested eager loading with Rel.flatten: users -> comments -> replies *)
+  let users_comments =
+    ok (Blocking.load_many db user_comments users ~order_by:[ asc Comments.id ])
+  in
+  let flat_comments, reattach = Rel.flatten users_comments in
+  let comments_with_replies =
+    ok
+      (Blocking.load_many db comment_replies flat_comments
+         ~order_by:[ asc Comments.id ])
+  in
+  let nested = reattach comments_with_replies in
+  Alcotest.(check (list (pair string (list (pair int (list int))))))
+    "3-level Rel.flatten nested load"
+    [
+      ("Ann", [ (10, [ 11; 12 ]) ]); ("Bob", [ (11, []); (12, []) ]); ("Cy", []);
+    ]
+    (List.map
+       (fun ((u : Users.t), cs) ->
+         ( u.name,
+           List.map
+             (fun ((c : Comments.t), rs) ->
+               (c.id, List.map (fun (r : Comments.t) -> r.id) rs))
+             cs ))
+       nested);
+
+  (* has_one + many_to_many through a join table *)
+  let user_first_comment =
+    Rel.has_one ~parent_key:Users.id ~child:Comments.table
+      ~child_key:Comments.author_id
+  in
+  let has_one_loaded = ok (Blocking.load_has_one db user_first_comment users) in
+  Alcotest.(check (list (pair string bool)))
+    "load_has_one"
+    [ ("Ann", true); ("Bob", true); ("Cy", false) ]
+    (List.map
+       (fun ((u : Users.t), c) -> (u.name, Option.is_some c))
+       has_one_loaded);
+
+  (* Many-to-many: users <-> user_tags <-> tags *)
+  let module Tags = struct
+    type t = { id : int; label : string }
+
+    let id = column "id" int (fun x -> x.id) ~primary_key:true
+    let label = column "label" text (fun x -> x.label)
+
+    let table =
+      table "tags"
+        (let+ id = col id and+ label = col label in
+         { id; label })
+  end in
+  let module User_tags = struct
+    type t = { user_id : int; tag_id : int }
+
+    let user_id = column "user_id" int (fun x -> x.user_id)
+    let tag_id = column "tag_id" int (fun x -> x.tag_id)
+
+    let table =
+      table "user_tags"
+        (let+ user_id = col user_id and+ tag_id = col tag_id in
+         { user_id; tag_id })
+  end in
+  drop db "user_tags";
+  drop db "tags";
+  ok (Blocking.create_table db Tags.table);
+  ok (Blocking.create_table db User_tags.table);
+  ok
+    (Blocking.insert_many db Tags.table
+       [ { id = 1; label = "ocaml" }; { id = 2; label = "sql" } ]);
+  ok
+    (Blocking.insert_many db User_tags.table
+       [
+         { user_id = 1; tag_id = 1 };
+         { user_id = 1; tag_id = 2 };
+         { user_id = 2; tag_id = 2 };
+       ]);
+  let user_tags =
+    Rel.many_to_many ~source_key:Users.id ~through:User_tags.table
+      ~through_source_key:User_tags.user_id ~through_target_key:User_tags.tag_id
+      ~target:Tags.table ~target_key:Tags.id
+  in
+  let loaded_m2m =
+    ok
+      (Blocking.load_many_to_many db user_tags users ~order_by:(fun t ->
+           [ Expr.asc Query.(t.@(Tags.label)) ]))
+  in
+  Alcotest.(check (list (pair string (list string))))
+    "load_many_to_many"
+    [ ("Ann", [ "ocaml"; "sql" ]); ("Bob", [ "sql" ]); ("Cy", []) ]
+    (List.map
+       (fun ((u : Users.t), ts) ->
+         (u.name, List.map (fun (t : Tags.t) -> t.label) ts))
+       loaded_m2m);
+  let joined_m2m =
+    Query.(
+      build
+        (let* u = from Users.table in
+         let* t = left_join_m2m u user_tags in
+         let* () =
+           order_by [ asc u.@(Users.id); nulls_last (asc t.@?(Tags.label)) ]
+         in
+         select
+           (let+ uname = expr u.@(Users.name)
+            and+ tlabel = expr t.@?(Tags.label) in
+            (uname, tlabel))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair string (option string))))
+    "left_join_m2m"
+    [
+      ("Ann", Some "ocaml");
+      ("Ann", Some "sql");
+      ("Bob", Some "sql");
+      ("Cy", None);
+    ]
+    joined_m2m
+
+let test_pg_distinct_on db =
+  seed db;
+  ok
+    (Blocking.insert_many db Comments.table
+       [
+         { id = 10; author_id = 1; body = "ann first"; reply_to = None };
+         { id = 11; author_id = 1; body = "ann latest"; reply_to = Some 10 };
+         { id = 12; author_id = 2; body = "bob first"; reply_to = None };
+         { id = 13; author_id = 2; body = "bob latest"; reply_to = Some 12 };
+       ]);
+  let latest_per_author =
+    Q.(
+      build ~name:"pg_distinct_on"
+        (let* c = from Comments.table in
+         distinct_on [ Expr.any c.@(Comments.author_id) ]
+         &> order_by [ asc c.@(Comments.author_id); desc c.@(Comments.id) ]
+         &> select2 c.@(Comments.author_id) c.@(Comments.body)))
+  in
+  Alcotest.(check (list (pair int string)))
+    "DISTINCT ON latest comment per author"
+    [ (1, "ann latest"); (2, "bob latest") ]
+    (ok (Blocking.query_all db latest_per_author));
+  Alcotest.(check int)
+    "query_count on DISTINCT ON" 2
+    (ok (Blocking.query_count db latest_per_author));
+  Alcotest.(check bool)
+    "query_exists on DISTINCT ON (true)" true
+    (ok (Blocking.query_exists db latest_per_author));
+  let none_matching =
+    Q.(
+      build
+        (let* c = from Comments.table in
+         distinct_on [ Expr.any c.@(Comments.author_id) ]
+         &> where (c.@(Comments.author_id) =. 999)
+         &> order_by [ asc c.@(Comments.author_id) ]
+         &> select1 c.@(Comments.body)))
+  in
+  Alcotest.(check bool)
+    "query_exists on DISTINCT ON (false)" false
+    (ok (Blocking.query_exists db none_matching))
+
+let test_pg_jsonb db =
+  seed db;
+  let now = Ptime.of_float_s 1_700_000_000. |> Option.get in
+  ok
+    (Blocking.insert_many db Things.table
+       [
+         {
+           id = 1;
+           big = 10L;
+           ratio = 1.5;
+           flag = true;
+           blob = "a";
+           at = now;
+           day = now;
+           uid = "00000000-0000-0000-0000-000000000001";
+           doc =
+             {|{"role":"admin","meta":{"team":"core","level":3},"active":true}|};
+         };
+         {
+           id = 2;
+           big = 20L;
+           ratio = 2.5;
+           flag = false;
+           blob = "b";
+           at = now;
+           day = now;
+           uid = "00000000-0000-0000-0000-000000000002";
+           doc = {|{"role":"viewer","meta":{"team":"ops"}}|};
+         };
+       ]);
+  (* ->, ->>, jsonb_extract_path_text *)
+  let extracted =
+    Q.(
+      build
+        (let* t = from Things.table in
+         order_by [ asc t.@(Things.id) ]
+         &> select4
+              (Json.get_text t.@(Things.doc) (text "role"))
+              (Json.path_text t.@(Things.doc) [ "meta"; "team" ])
+              (Json.path_text t.@(Things.doc) [ "meta"; "missing" ])
+              (Json.get t.@(Things.doc) (text "active"))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(
+    check
+      (list
+         (pair
+            (pair (option string) (option string))
+            (pair (option string) (option string)))))
+    "jsonb get / get_text / path_text"
+    [
+      ((Some "admin", Some "core"), (None, Some "true"));
+      ((Some "viewer", Some "ops"), (None, None));
+    ]
+    (List.map (fun (a, b, c, d) -> ((a, b), (c, d))) extracted);
+  (* @> containment *)
+  let admins =
+    Q.(
+      build
+        (let* t = from Things.table in
+         where
+           (Json.contains t.@(Things.doc) (text {|{"meta":{"team":"core"}}|}))
+         &> select1 t.@(Things.id)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list int)) "jsonb @> contains" [ 1 ] admins;
+  (* jsonb_exists alongside another bound parameter (no ?/$1 collision) *)
+  let with_active_key =
+    Q.(
+      build
+        (let* t = from Things.table in
+         where
+           (t.@(Things.id) >=. 1 && Json.has_key t.@(Things.doc) (text "active"))
+         &> select1 t.@(Things.id)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list int))
+    "jsonb_exists with bound param" [ 1 ] with_active_key;
+  (* Nullable jsonb helpers across a LEFT JOIN *)
+  let joined_json =
+    Q.(
+      build
+        (let* u = from Users.table in
+         let* t =
+           left_join Things.table ~on:(fun t -> t.@(Things.id) = u.@(Users.id))
+         in
+         order_by [ asc u.@(Users.id) ]
+         &> select3 u.@(Users.name)
+              (Json.get_text_opt t.@?(Things.doc) (text "role"))
+              (Json.path_text_opt t.@?(Things.doc) [ "meta"; "team" ])))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (triple string (option string) (option string))))
+    "nullable jsonb helpers over LEFT JOIN"
+    [
+      ("Ann", Some "admin", Some "core");
+      ("Bob", Some "viewer", Some "ops");
+      ("Cy", None, None);
+    ]
+    joined_json;
+  let joined_has_key =
+    Q.(
+      build
+        (let* u = from Users.table in
+         let* t =
+           left_join Things.table ~on:(fun t -> t.@(Things.id) = u.@(Users.id))
+         in
+         where
+           (Json.has_key_opt t.@?(Things.doc) (text "active")
+           || Json.contains_opt t.@?(Things.doc) (text {|{"role":"viewer"}|}))
+         &> order_by [ asc u.@(Users.id) ]
+         &> select1 u.@(Users.name)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list string))
+    "nullable jsonb_exists / contains_opt" [ "Ann"; "Bob" ] joined_has_key
+
+let test_pg_array_and_functions db =
+  seed db;
+  drop db "pg_articles";
+  Fun.protect ~finally:(fun () -> drop db "pg_articles") @@ fun () ->
+  let text_arr = ty Caqti_type.string "TEXT[]" in
+  let id_c = column "id" int fst ~primary_key:true in
+  let tags_c = column "tags" text_arr snd in
+  let articles =
+    table "pg_articles"
+      (let+ id = col id_c and+ tags = col tags_c in
+       (id, tags))
+  in
+  ok (Blocking.create_table db articles);
+  ok
+    (Blocking.insert_many db articles
+       [ (1, "{ocaml,postgres}"); (2, "{rust,sqlite}"); (3, "{ocaml,sql}") ]);
+  (* elem = ANY(column) *)
+  let ocaml_ids =
+    Q.(
+      build
+        (let* a = from articles in
+         where (Pg.any_array (text "ocaml") a.@(tags_c))
+         &> order_by [ asc a.@(id_c) ]
+         &> select1 a.@(id_c)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list int))
+    "Pg.any_array against TEXT[] column" [ 1; 3 ] ocaml_ids;
+  (* column = ANY(CAST($1 AS TEXT[])) *)
+  let chosen_users =
+    Q.(
+      build
+        (let* u = from Users.table in
+         where (Pg.any_array u.@(Users.name) (cast text_arr (text "{Ann,Cy}")))
+         &> order_by [ asc u.@(Users.id) ]
+         &> select1 u.@(Users.name)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list string))
+    "Pg.any_array against bound TEXT[] param" [ "Ann"; "Cy" ] chosen_users;
+  (* date_trunc + now + ILIKE + CHAR_LENGTH (multibyte UTF-8) *)
+  let ts =
+    Ptime.of_date_time ((2023, 11, 14), ((22, 13, 45), 0)) |> Option.get
+  in
+  let expected_min =
+    Ptime.of_date_time ((2023, 11, 14), ((22, 13, 0), 0)) |> Option.get
+  in
+  ok
+    (Blocking.insert db Things.table
+       {
+         id = 1;
+         big = 1L;
+         ratio = 1.0;
+         flag = true;
+         blob = "x";
+         at = ts;
+         day = ts;
+         uid = "00000000-0000-0000-0000-000000000001";
+         doc = "{}";
+       });
+  let trunc_ts, server_now =
+    Q.(
+      build
+        (let* t = from Things.table in
+         select2 (Pg.date_trunc "minute" t.@(Things.at)) (now ())))
+    |> Blocking.query_one db |> ok
+  in
+  Alcotest.(check bool)
+    "Pg.date_trunc truncates to minute" true
+    (Ptime.equal trunc_ts expected_min);
+  Alcotest.(check bool)
+    "Expr.now returns timestamp after 2020" true
+    (Ptime.is_later server_now
+       ~than:(Ptime.of_float_s 1_577_836_800. |> Option.get));
+  (* Native ILIKE and CHAR_LENGTH *)
+  ok
+    (Blocking.insert db Users.table
+       { id = 4; name = "café"; age = 25; email = Some "CAFE@X.ORG" });
+  let ilike_names =
+    Q.(
+      build
+        (let* u = from Users.table in
+         where
+           (ilike u.@(Users.name) (text "ann%")
+           || ilike_opt u.@(Users.email) (text "cafe%"))
+         &> order_by [ asc u.@(Users.id) ]
+         &> select2 u.@(Users.name) (length u.@(Users.name))))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair string int)))
+    "Postgres ILIKE + CHAR_LENGTH on UTF-8"
+    [ ("Ann", 3); ("café", 4) ]
+    ilike_names
+
+let test_pg_joins_and_compounds db =
+  seed db;
+  ok
+    (Blocking.insert_many db Comments.table
+       [
+         { id = 10; author_id = 1; body = "hello"; reply_to = None };
+         { id = 11; author_id = 2; body = "world"; reply_to = None };
+         { id = 12; author_id = 99; body = "orphan"; reply_to = None };
+       ]);
+  (* RIGHT JOIN: unmatched right user (Cy) gets None on left opt_ref *)
+  let right_rows =
+    Q.(
+      build
+        (let* c = from Comments.table in
+         let* c, u =
+           right_join c Users.table ~on:(fun u ->
+               u.@(Users.id) = c.@(Comments.author_id))
+         in
+         order_by [ asc u.@(Users.id) ]
+         &> select2 u.@(Users.name) c.@?(Comments.body)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair string (option string))))
+    "RIGHT JOIN on Postgres"
+    [ ("Ann", Some "hello"); ("Bob", Some "world"); ("Cy", None) ]
+    right_rows;
+  (* FULL JOIN: unmatched rows on BOTH sides *)
+  let full_rows =
+    Q.(
+      build
+        (let* c = from Comments.table in
+         let* c, u =
+           full_join c Users.table ~on:(fun u ->
+               u.@(Users.id) = c.@(Comments.author_id))
+         in
+         order_by
+           [
+             nulls_last (asc u.@?(Users.id)); nulls_last (asc c.@?(Comments.id));
+           ]
+         &> select2 u.@?(Users.name) c.@?(Comments.body)))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair (option string) (option string))))
+    "FULL JOIN with unmatched rows on both sides"
+    [
+      (Some "Ann", Some "hello");
+      (Some "Bob", Some "world");
+      (Some "Cy", None);
+      (None, Some "orphan");
+    ]
+    full_rows;
+  (* Compound queries: UNION ALL, INTERSECT, EXCEPT, and parenthesised CTE branches *)
+  let seniors =
+    Q.(
+      build
+        (let* u = from Users.table in
+         where (u.@(Users.age) >=. 30)
+         &> order_by [ asc u.@(Users.id) ]
+         &> limit 10
+         &> select1 u.@(Users.name)))
+  in
+  let has_comment =
+    Q.(
+      build
+        (let* cte, cid =
+           with_cte "authors"
+             (let* c = from Comments.table in
+              select_named (field "author_id" c.@(Comments.author_id)))
+         in
+         let* u = from Users.table in
+         let* a = join_cte cte ~on:(fun a -> a.@(cid) = u.@(Users.id)) in
+         let _ = a in
+         order_by [ asc u.@(Users.id) ] &> select1 u.@(Users.name)))
+  in
+  let inter =
+    Query.intersect seniors has_comment
+    |> Blocking.query_all db |> ok |> List.sort compare
+  in
+  Alcotest.(check (list string))
+    "INTERSECT with CTE branch" [ "Ann"; "Bob" ] inter;
+  let all_u =
+    Q.(
+      build
+        (let* u = from Users.table in
+         select1 u.@(Users.name)))
+  in
+  let exc = Query.except all_u has_comment |> Blocking.query_all db |> ok in
+  Alcotest.(check (list string)) "EXCEPT with CTE branch" [ "Cy" ] exc;
+  let uall =
+    Query.union_all seniors has_comment
+    |> Query.with_limit 3 |> Query.with_offset 1 |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check int) "UNION ALL with_limit/with_offset" 3 (List.length uall)
+
+let test_pg_multi_table_writes db =
+  seed db;
+  ok
+    (Blocking.insert_many db Comments.table
+       [
+         { id = 10; author_id = 1; body = "a1"; reply_to = None };
+         { id = 11; author_id = 2; body = "b1"; reply_to = None };
+       ]);
+  (* Real UPDATE ... FROM with joined table + qualified RETURNING *)
+  let updated =
+    Q.(
+      update_from Users.table (fun u ->
+          let* c = from Comments.table in
+          let* () =
+            where
+              (c.@(Comments.author_id) = u.@(Users.id) && c.@(Comments.id) =. 10)
+          in
+          return [ set Users.age (u.@(Users.age) + int 5) ]))
+    |> fun p ->
+    ok (Blocking.update_from_returning db p [ Users.name; Users.age ])
+    |> List.map (fun Row.[ name; age ] -> (name, age))
+  in
+  Alcotest.(check (list (pair string int)))
+    "UPDATE ... FROM ... RETURNING"
+    [ ("Ann", 39) ]
+    updated;
+  let upd_count =
+    Q.(
+      update_from Users.table (fun u ->
+          let* c = from Comments.table in
+          let* () = where (c.@(Comments.author_id) = u.@(Users.id)) in
+          return [ set Users.age (u.@(Users.age) + int 1) ]))
+    |> Blocking.update_from_count db
+    |> ok
+  in
+  Alcotest.(check int) "UPDATE ... FROM count" 2 upd_count;
+  (* Real DELETE ... USING with joined table + qualified RETURNING *)
+  let deleted =
+    Q.(
+      delete_using Comments.table (fun c ->
+          let* u = from Users.table in
+          where
+            (u.@(Users.id) = c.@(Comments.author_id) && u.@(Users.name) =. "Ann")))
+    |> fun p -> ok (Blocking.delete_using_returning db p (col Comments.id))
+  in
+  Alcotest.(check (list int)) "DELETE ... USING ... RETURNING" [ 10 ] deleted;
+  let del_count =
+    Q.(
+      delete_using Comments.table (fun c ->
+          let* u = from Users.table in
+          where
+            (u.@(Users.id) = c.@(Comments.author_id) && u.@(Users.age) >=. 50)))
+    |> Blocking.delete_using_count db
+    |> ok
+  in
+  Alcotest.(check int) "DELETE ... USING count" 1 del_count
+
+let test_pg_row_locking url db =
+  seed db;
+  let q_for_update =
+    Q.(
+      build
+        (let* u = from Users.table in
+         where (u.@(Users.id) =. 1) &> for_update () &> select1 u.@(Users.id)))
+  in
+  (* query_count and query_exists strip FOR UPDATE so Postgres does not error *)
+  Alcotest.(check int)
+    "query_count strips FOR UPDATE on Postgres" 1
+    (ok (Blocking.query_count db q_for_update));
+  Alcotest.(check bool)
+    "query_exists strips FOR UPDATE on Postgres" true
+    (ok (Blocking.query_exists db q_for_update));
+  (* Verify real lock contention across two connections *)
+  let db2 = ok (Caqti_blocking.connect (Uri.of_string url)) in
+  let (module Db2 : DB) = db2 in
+  Fun.protect ~finally:Db2.disconnect @@ fun () ->
+  (* 1. db holds FOR UPDATE on id=1 -> db2 skips id=1 with SKIP LOCKED and
+     fails immediately with FOR UPDATE NOWAIT and FOR SHARE NOWAIT. *)
+  ok
+    (Blocking.transaction db (fun () ->
+         let locked = ok (Blocking.query_all db q_for_update) in
+         Alcotest.(check (list int)) "db locked id=1" [ 1 ] locked;
+         let skipped =
+           Q.(
+             build
+               (let* u = from Users.table in
+                order_by [ asc u.@(Users.id) ]
+                &> for_update ~skip_locked:true ()
+                &> select1 u.@(Users.id)))
+           |> fun q ->
+           ok (Blocking.transaction db2 (fun () -> Blocking.query_all db2 q))
+         in
+         Alcotest.(check (list int))
+           "FOR UPDATE SKIP LOCKED skips locked row" [ 2; 3 ] skipped;
+         let nowait_res =
+           Q.(
+             build
+               (let* u = from Users.table in
+                where (u.@(Users.id) =. 1)
+                &> for_update ~nowait:true ()
+                &> select1 u.@(Users.id)))
+           |> fun q ->
+           Blocking.transaction db2 (fun () -> Blocking.query_all db2 q)
+         in
+         Alcotest.(check bool)
+           "FOR UPDATE NOWAIT fails on locked row" true
+           (Result.is_error nowait_res);
+         let share_nowait_res =
+           Q.(
+             build
+               (let* u = from Users.table in
+                where (u.@(Users.id) =. 1)
+                &> for_share ~nowait:true ()
+                &> select1 u.@(Users.id)))
+           |> fun q ->
+           Blocking.transaction db2 (fun () -> Blocking.query_all db2 q)
+         in
+         Alcotest.(check bool)
+           "FOR SHARE NOWAIT blocked by FOR UPDATE" true
+           (Result.is_error share_nowait_res);
+         Ok ()));
+  (* 2. db holds FOR SHARE on id=1 -> db2 succeeds with FOR SHARE NOWAIT,
+     fails with FOR UPDATE NOWAIT. *)
+  ok
+    (Blocking.transaction db (fun () ->
+         let q_share =
+           Q.(
+             build
+               (let* u = from Users.table in
+                where (u.@(Users.id) =. 1)
+                &> for_share ()
+                &> select1 u.@(Users.id)))
+         in
+         let shared = ok (Blocking.query_all db q_share) in
+         Alcotest.(check (list int)) "db shared-locked id=1" [ 1 ] shared;
+         let share2 =
+           Q.(
+             build
+               (let* u = from Users.table in
+                where (u.@(Users.id) =. 1)
+                &> for_share ~nowait:true ()
+                &> select1 u.@(Users.id)))
+           |> fun q ->
+           ok (Blocking.transaction db2 (fun () -> Blocking.query_all db2 q))
+         in
+         Alcotest.(check (list int))
+           "FOR SHARE NOWAIT compatible with FOR SHARE" [ 1 ] share2;
+         let upd_nowait_res =
+           Q.(
+             build
+               (let* u = from Users.table in
+                where (u.@(Users.id) =. 1)
+                &> for_update ~nowait:true ()
+                &> select1 u.@(Users.id)))
+           |> fun q ->
+           Blocking.transaction db2 (fun () -> Blocking.query_all db2 q)
+         in
+         Alcotest.(check bool)
+           "FOR UPDATE NOWAIT blocked by FOR SHARE" true
+           (Result.is_error upd_nowait_res);
+         Ok ()))
+
+let test_pg_windows_and_casts db =
+  let now = Ptime.of_float_s 1_700_000_000. |> Option.get in
+  let mk id big ratio flag =
+    {
+      Things.id;
+      big;
+      ratio;
+      flag;
+      blob = "x";
+      at = now;
+      day = now;
+      uid = Printf.sprintf "00000000-0000-0000-0000-00000000000%d" id;
+      doc = "{}";
+    }
+  in
+  ok
+    (Blocking.insert_many db Things.table
+       [ mk 1 100L 1.5 true; mk 2 100L 2.5 true; mk 3 300L 6.0 false ]);
+  (* Plain + FILTER aggregates with Postgres BIGINT / DOUBLE PRECISION casts *)
+  let s_i64, s_flt, avg_f, filt_i64 =
+    Q.(
+      build
+        (let* t = from Things.table in
+         select4
+           (sum_int64 t.@(Things.big))
+           (sum_float t.@(Things.ratio))
+           (avg t.@(Things.ratio))
+           (sum_int64 t.@(Things.big) |> filter (t.@(Things.flag) =. true))))
+    |> Blocking.query_one db |> ok
+  in
+  Alcotest.(check (option int64)) "sum_int64 cast" (Some 500L) s_i64;
+  Alcotest.(check (option (float 1e-6))) "sum_float cast" (Some 10.0) s_flt;
+  Alcotest.(check (option (float 1e-6))) "avg cast" (Some (10.0 /. 3.0)) avg_f;
+  Alcotest.(check (option int64)) "sum_int64 FILTER cast" (Some 200L) filt_i64;
+  (* Combined FILTER + OVER inside Postgres CAST, plus rank/dense_rank/lead/first_value *)
+  let win_rows =
+    Q.(
+      build
+        (let* t = from Things.table in
+         order_by [ asc t.@(Things.id) ]
+         &> select4
+              (rank ~order_by:[ asc t.@(Things.big) ] ())
+              (dense_rank ~order_by:[ asc t.@(Things.big) ] ())
+              (lead_default ~default:(int64 0L)
+                 ~order_by:[ asc t.@(Things.id) ]
+                 t.@(Things.big))
+              (sum_int64 t.@(Things.big)
+              |> filter (t.@(Things.flag) =. true)
+              |> over ~order_by:[ asc t.@(Things.id) ])))
+    |> Blocking.query_all db |> ok
+  in
+  Alcotest.(check (list (pair (pair int int) (pair int64 (option int64)))))
+    "rank / dense_rank / lead_default / FILTER + OVER inside CAST"
+    [
+      ((1, 1), (100L, Some 100L));
+      ((1, 1), (300L, Some 200L));
+      ((3, 2), (0L, Some 200L));
+    ]
+    (List.map (fun (a, b, c, d) -> ((a, b), (c, d))) win_rows)
+
+let pg_only_tests url =
+  List.map
+    (fun (name, f) -> Alcotest.test_case name `Quick (with_db url f))
+    [
+      ("postgres DISTINCT ON", test_pg_distinct_on);
+      ("postgres JSONB helpers", test_pg_jsonb);
+      ("postgres arrays, date_trunc, ILIKE", test_pg_array_and_functions);
+      ("postgres RIGHT/FULL JOIN and compounds", test_pg_joins_and_compounds);
+      ("postgres UPDATE FROM and DELETE USING", test_pg_multi_table_writes);
+      ("postgres row locking (FOR UPDATE/SHARE)", test_pg_row_locking url);
+      ("postgres windows and aggregate casts", test_pg_windows_and_casts);
+    ]
+
 let db_tests url =
   List.map
     (fun (name, f) -> Alcotest.test_case name `Quick (with_db url f))
     [
       ("read", test_read);
       ("joins", test_joins);
+      ("multi-table builder", test_multi_db);
+      ("relations and eager loading", test_relations_db);
       ("insert returning", test_insert_returning);
       ("upsert", test_upsert);
       ("update and delete", test_update_delete);
@@ -1481,6 +3300,7 @@ let () =
           Alcotest.test_case "list select" `Quick test_list_select;
           Alcotest.test_case "joins" `Quick test_join_sql;
           Alcotest.test_case "conditions" `Quick test_conditions;
+          Alcotest.test_case "multi-table builder" `Quick test_multi_sql;
         ] );
       ( "changeset",
         [
@@ -1495,7 +3315,7 @@ let () =
       ("sqlite", db_tests "sqlite3::memory:");
       ( "postgres",
         match Sys.getenv_opt "QB_TEST_PG_URL" with
-        | Some url -> db_tests url
+        | Some url -> db_tests url @ pg_only_tests url
         | None ->
             [
               Alcotest.test_case "set QB_TEST_PG_URL to run" `Quick (fun () ->

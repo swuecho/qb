@@ -48,32 +48,45 @@ let run url =
   in
   let* () = from Notes.table |> where all_rows |> Qb_lwt.delete db in
   let* left = from Notes.table |> Qb_lwt.count db in
-  (* A transaction inside another is refused, and the connection is usable
-     afterwards. *)
-  let* refused =
-    Lwt.catch
-      (fun () ->
-        let* () =
-          Qb_lwt.transaction db (fun () ->
-              Qb_lwt.transaction db (fun () -> Lwt.return_ok ()))
-        in
-        Lwt.return_ok false)
-      (function Invalid_argument _ -> Lwt.return_ok true | e -> Lwt.fail e)
-  in
+  (* Nested transactions use SAVEPOINT: an inner Error rolls back only the
+     inner savepoint while the outer transaction commits. *)
   let* () =
     Qb_lwt.transaction db (fun () ->
-        Qb_lwt.insert db Notes.table { id = 7; body = "kept" })
+        let* () = Qb_lwt.insert db Notes.table { id = 7; body = "kept" } in
+        let* inner =
+          Qb_lwt.transaction db (fun () ->
+              let* () =
+                Qb_lwt.insert db Notes.table { id = 8; body = "rolled_back" }
+              in
+              Lwt.return_error `Abort)
+          |> Lwt.map (function
+            | Error `Abort -> Ok ()
+            | Ok () -> Ok ()
+            | Error (#Caqti_error.t as e) -> Error e)
+        in
+        let () = inner in
+        Lwt.return_ok ())
   in
   let* kept = from Notes.table |> Qb_lwt.count db in
+  (* Multi-table Qb.Query works through Qb_lwt too. *)
+  let* queried =
+    Qb.Query.(
+      build
+        (let* n = from Notes.table in
+         let* () = where Expr.Ops.(n.@(Notes.id) = Expr.int 7) in
+         select (expr n.@(Notes.body))))
+    |> Qb_lwt.query_all db
+  in
   let* () = Db.disconnect () |> Lwt_result.ok in
-  Lwt.return_ok (id, bodies, left, refused, kept)
+  Lwt.return_ok (id, bodies, left, kept, queried)
 
 let test url () =
   match Lwt_main.run (run url) with
   | Error e -> Alcotest.fail (Caqti_error.show e)
-  | Ok (id, bodies, left, refused, kept) ->
-      Alcotest.(check bool) "a nested transaction is refused" true refused;
-      Alcotest.(check int) "and the next one commits" 1 kept;
+  | Ok (id, bodies, left, kept, queried) ->
+      Alcotest.(check int)
+        "nested savepoint rolled back inner, kept outer" 1 kept;
+      Alcotest.(check (list string)) "Qb_lwt.query_all" [ "kept" ] queried;
       Alcotest.(check int) "returned id" 1 id;
       Alcotest.(check (list string)) "bodies" [ "second"; "edited" ] bodies;
       Alcotest.(check int) "deleted all" 0 left

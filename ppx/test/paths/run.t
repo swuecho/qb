@@ -29,7 +29,7 @@ The search stops at the project root: a schema above it isn't found.
   $ (cd proj/inner/src && ../../../driver.exe -qb-schema schema -impl q.ml -o ../../../out.ml)
   $ expands out.ml
   0
-  qb: schema: schema: No such file or directory (is it in preprocessor_deps?)
+  qb: schema: schema: No such file or directory (looked in src, .; is it in preprocessor_deps?)
 
 An empty migrations folder says so directly, rather than claiming -qb-schema
 was omitted.
